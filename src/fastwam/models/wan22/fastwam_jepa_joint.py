@@ -47,6 +47,8 @@ class FastWAMJEPAJoint(nn.Module):
         action_train_shift: float = 5.0,
         action_num_train_timesteps: int = 1000,
         lambda_future: float = 0.1,
+        current_frame_count: int = 2,
+        future_frame_count: int = 1,
     ) -> None:
         super().__init__()
         if action_expert is None:
@@ -62,6 +64,8 @@ class FastWAMJEPAJoint(nn.Module):
         self.device = None if device is None else torch.device(device)
         self.torch_dtype = torch_dtype
         self.lambda_future = float(lambda_future)
+        self.current_frame_count = int(current_frame_count)
+        self.future_frame_count = int(future_frame_count)
 
         if self.action_dim != int(action_expert.action_dim):
             raise ValueError(
@@ -78,6 +82,14 @@ class FastWAMJEPAJoint(nn.Module):
         if self.num_future_tokens <= 0:
             raise ValueError(
                 f"`num_future_tokens` must be positive, got {self.num_future_tokens}."
+            )
+        if self.current_frame_count <= 0:
+            raise ValueError(
+                f"`current_frame_count` must be positive, got {self.current_frame_count}."
+            )
+        if self.future_frame_count <= 0:
+            raise ValueError(
+                f"`future_frame_count` must be positive, got {self.future_frame_count}."
             )
 
         self.vjepa_encoder = vjepa_encoder or VJepaEncoderWrapper(
@@ -231,8 +243,18 @@ class FastWAMJEPAJoint(nn.Module):
         action_is_pad = inputs["action_is_pad"]
         batch_size = int(video.shape[0])
 
-        current_video = video[:, :, :1]
-        future_video = video[:, :, 1:]
+        # FastWAMJEPAJoint v1 defaults to real consecutive two-frame current
+        # video and the following one frame as the future target. This does not
+        # modify original FastWAM default behavior.
+        total_required = self.current_frame_count + self.future_frame_count
+        if video.shape[2] < total_required:
+            raise ValueError(
+                "`sample['video']` does not contain enough frames for FastWAMJEPAJoint, "
+                f"got T={video.shape[2]}, required at least {total_required} "
+                f"({self.current_frame_count} current + {self.future_frame_count} future)."
+            )
+        current_video = video[:, :, : self.current_frame_count]
+        future_video = video[:, :, self.current_frame_count : total_required]
 
         current_visual_tokens = self.vjepa_encoder(current_video)
         target_future_tokens = self.vjepa_encoder(future_video).detach()

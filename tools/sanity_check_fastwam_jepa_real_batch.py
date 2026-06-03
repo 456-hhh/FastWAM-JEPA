@@ -88,7 +88,32 @@ def compose_cfg(config_name: str, task: str) -> DictConfig:
         return compose(config_name=config_name, overrides=[f"task={task}"])
 
 
+def resolve_dataset_dirs(cfg: DictConfig) -> None:
+    dataset_dirs = cfg.data.train.get("dataset_dirs")
+    if dataset_dirs is None:
+        raise ValueError("`cfg.data.train.dataset_dirs` is required for this sanity check.")
+
+    resolved_dirs: list[str] = []
+    print("Resolved dataset_dirs:")
+    for dataset_dir in dataset_dirs:
+        path = Path(str(dataset_dir))
+        if path.is_absolute():
+            abs_path = path.resolve()
+        else:
+            abs_path = (PROJECT_ROOT / path).resolve()
+
+        print(f"  {abs_path}")
+        if not abs_path.exists():
+            raise FileNotFoundError(f"Dataset directory does not exist: {abs_path}")
+        if not abs_path.is_dir():
+            raise FileNotFoundError(f"Dataset path is not a directory: {abs_path}")
+        resolved_dirs.append(str(abs_path))
+
+    cfg.data.train.dataset_dirs = resolved_dirs
+
+
 def build_one_batch_loader(cfg: DictConfig, *, batch_size: int, num_workers: int) -> DataLoader:
+    resolve_dataset_dirs(cfg)
     dataset = instantiate(cfg.data.train)
     print(f"Dataset: {type(dataset).__name__}, len={len(dataset)}")
     return DataLoader(

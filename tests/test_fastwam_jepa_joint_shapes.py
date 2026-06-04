@@ -46,7 +46,7 @@ class FakeActionExpert(nn.Module):
 
 def test_fastwam_jepa_joint_training_loss_dummy_shapes():
     batch_size = 2
-    num_frames = 3
+    num_frames = 4
     action_horizon = 4
     action_dim = 7
     image_size = 16

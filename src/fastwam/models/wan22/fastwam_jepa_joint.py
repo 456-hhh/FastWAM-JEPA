@@ -48,7 +48,7 @@ class FastWAMJEPAJoint(nn.Module):
         action_num_train_timesteps: int = 1000,
         lambda_future: float = 0.1,
         current_frame_count: int = 2,
-        future_frame_count: int = 1,
+        future_frame_count: int = 2,
     ) -> None:
         super().__init__()
         if action_expert is None:
@@ -243,9 +243,11 @@ class FastWAMJEPAJoint(nn.Module):
         action_is_pad = inputs["action_is_pad"]
         batch_size = int(video.shape[0])
 
-        # FastWAMJEPAJoint v1 defaults to real consecutive two-frame current
-        # video and the following one frame as the future target. This does not
-        # modify original FastWAM default behavior.
+        # FastWAMJEPAJoint v1 defaults to the first 2 frames as current
+        # observation and the next 2 frames as the future V-JEPA target. With
+        # V-JEPA2 vitg / tubelet_size=2 / img_size=256, 2 future frames produce
+        # 256 V-JEPA tokens, so the default num_future_tokens remains 256. This
+        # does not modify original FastWAM default behavior.
         total_required = self.current_frame_count + self.future_frame_count
         if video.shape[2] < total_required:
             raise ValueError(

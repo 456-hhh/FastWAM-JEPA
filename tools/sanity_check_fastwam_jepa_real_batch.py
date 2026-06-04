@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vjepa-dim", type=int, default=1408)
     parser.add_argument("--num-future-tokens", type=int, default=256)
     parser.add_argument("--current-frame-count", type=int, default=2)
-    parser.add_argument("--future-frame-count", type=int, default=1)
+    parser.add_argument("--future-frame-count", type=int, default=2)
     parser.add_argument("--lambda-future", type=float, default=0.1)
     return parser.parse_args()
 
@@ -292,6 +292,12 @@ def main() -> None:
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype, device)
     print(f"Using device={device}, dtype={dtype}")
+    print(
+        "Frame settings: "
+        f"current_frame_count={args.current_frame_count}, "
+        f"future_frame_count={args.future_frame_count}, "
+        f"num_future_tokens={args.num_future_tokens}"
+    )
 
     cfg = compose_cfg(config_name=args.config_name, task=args.task)
     loader = build_one_batch_loader(

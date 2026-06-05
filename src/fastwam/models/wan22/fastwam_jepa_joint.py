@@ -45,6 +45,7 @@ class FastWAMJEPAJoint(nn.Module):
         device: Optional[str] = None,
         torch_dtype: torch.dtype = torch.float32,
         action_train_shift: float = 5.0,
+        action_infer_shift: float = 5.0,
         action_num_train_timesteps: int = 1000,
         lambda_future: float = 0.1,
         current_frame_count: int = 2,
@@ -108,6 +109,10 @@ class FastWAMJEPAJoint(nn.Module):
         self.train_action_scheduler = WanContinuousFlowMatchScheduler(
             num_train_timesteps=action_num_train_timesteps,
             shift=action_train_shift,
+        )
+        self.infer_action_scheduler = WanContinuousFlowMatchScheduler(
+            num_train_timesteps=action_num_train_timesteps,
+            shift=action_infer_shift,
         )
 
         if self.proprio_dim is not None:
@@ -336,3 +341,123 @@ class FastWAMJEPAJoint(nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.training_loss(*args, **kwargs)
+
+    @torch.no_grad()
+    def predict_action(
+        self,
+        *,
+        current_video: torch.Tensor,
+        action_horizon: int,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        proprio: Optional[torch.Tensor] = None,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+    ) -> dict[str, torch.Tensor]:
+        """Sample an action chunk from current V-JEPA visual tokens.
+
+        This inference path has no future-video target. The future-query branch
+        remains an auxiliary latent path inside VJepaACJointPredictor; the action
+        output still comes from ActionDiT.post_dit().
+        """
+        self.eval()
+        if current_video.ndim != 5:
+            raise ValueError(
+                "`current_video` must be 5D [B, 3, T, H_img, W_img], "
+                f"got shape {tuple(current_video.shape)}."
+            )
+        if current_video.shape[1] != 3:
+            raise ValueError(
+                f"`current_video` channel dim must be 3, got {current_video.shape[1]}."
+            )
+        if current_video.shape[2] != self.current_frame_count:
+            raise ValueError(
+                "`current_video` temporal dim must match current_frame_count, "
+                f"got T={current_video.shape[2]} vs {self.current_frame_count}."
+            )
+        if action_horizon <= 0:
+            raise ValueError(f"`action_horizon` must be positive, got {action_horizon}.")
+
+        batch_size = int(current_video.shape[0])
+        device = self._runtime_device()
+        current_video = current_video.to(device=device, dtype=self.torch_dtype)
+
+        if context.ndim == 2:
+            context = context.unsqueeze(0)
+        if context_mask.ndim == 1:
+            context_mask = context_mask.unsqueeze(0)
+        if context.ndim != 3 or context_mask.ndim != 2:
+            raise ValueError(
+                "`context/context_mask` must be [B,L,D_t]/[B,L], "
+                f"got {tuple(context.shape)} and {tuple(context_mask.shape)}."
+            )
+        if context.shape[0] != batch_size or tuple(context_mask.shape) != tuple(context.shape[:2]):
+            raise ValueError(
+                "`context_mask` must match context [B,L] and batch size, "
+                f"got context={tuple(context.shape)}, mask={tuple(context_mask.shape)}, B={batch_size}."
+            )
+        if context.shape[2] != self.text_dim:
+            raise ValueError(f"`context` last dim must be {self.text_dim}, got {context.shape[2]}.")
+
+        if proprio is not None and proprio.ndim == 1:
+            proprio = proprio.unsqueeze(0)
+
+        condition_context = context.to(device=device, dtype=self.torch_dtype)
+        condition_mask = context_mask.to(device=device, dtype=torch.bool)
+        condition_context, condition_mask = self._append_proprio_to_context(
+            context=condition_context,
+            context_mask=condition_mask,
+            proprio=proprio,
+        )
+
+        current_visual_tokens = self.vjepa_encoder(current_video)
+
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        noisy_action = torch.randn(
+            (batch_size, int(action_horizon), self.action_dim),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=device, dtype=self.torch_dtype)
+
+        infer_timesteps, infer_deltas = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=int(num_inference_steps),
+            device=device,
+            dtype=noisy_action.dtype,
+            shift_override=sigma_shift,
+        )
+        for step_t, step_delta in zip(infer_timesteps, infer_deltas):
+            timestep_action = step_t.reshape(1).expand(batch_size).to(
+                device=device,
+                dtype=noisy_action.dtype,
+            )
+            action_pre = self.action_expert.pre_dit(
+                action_tokens=noisy_action,
+                timestep=timestep_action,
+                context=condition_context,
+                context_mask=condition_mask,
+            )
+            joint_out = self.joint_predictor(
+                current_visual_tokens=current_visual_tokens,
+                action_tokens=action_pre["tokens"],
+                condition_context=condition_context,
+                condition_mask=condition_mask,
+            )
+            pred_action_flow = self.action_expert.post_dit(
+                joint_out["updated_action_tokens"],
+                action_pre,
+            )
+            noisy_action = self.infer_action_scheduler.step(
+                pred_action_flow,
+                step_delta,
+                noisy_action,
+            )
+
+        action = noisy_action.detach().to(device="cpu", dtype=torch.float32)
+        if batch_size == 1:
+            action = action[0]
+        return {
+            "action": action,
+        }

@@ -467,6 +467,11 @@ def run_episode(
 
 def main() -> None:
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    # LIBERO/robosuite imports MuJoCo during environment construction. On the
+    # training server we prefer EGL for headless GPU rendering; users can still
+    # override these from the shell before launching the script.
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
     args = parse_args()
     output_dir = resolve_path(args.output_dir)
     assert output_dir is not None

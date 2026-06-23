@@ -15,7 +15,7 @@ import torch
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
-
+from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -70,9 +70,13 @@ class FrameHistory:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate FastWAM-JEPA-Joint v1 on LIBERO.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate FastWAM-JEPA-Joint v1 on LIBERO."
+    )
     parser.add_argument("--checkpoint", default=DEFAULT_JEPA_CHECKPOINT)
-    parser.add_argument("--fastwam-base-checkpoint", default=DEFAULT_FASTWAM_BASE_CHECKPOINT)
+    parser.add_argument(
+        "--fastwam-base-checkpoint", default=DEFAULT_FASTWAM_BASE_CHECKPOINT
+    )
     parser.add_argument("--vjepa-checkpoint", default=DEFAULT_VJEPA_CHECKPOINT)
     parser.add_argument("--vjepa-repo", default=DEFAULT_VJEPA_REPO)
     parser.add_argument("--output-dir", default="evaluate_results/fastwam_jepa_joint")
@@ -80,6 +84,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--mujoco-gl",
+        default="egl",
+        choices=["egl", "osmesa", "glfw"],
+        help="MuJoCo GL backend. Default uses EGL for headless GPU rendering.",
+    )
+    parser.add_argument(
+        "--pyopengl-platform",
+        default="egl",
+        choices=["egl", "osmesa", "glfw"],
+        help="PyOpenGL platform. Default matches the EGL MuJoCo backend.",
+    )
+    parser.add_argument(
+        "--egl-device-id",
+        type=int,
+        default=0,
+        help=(
+            "EGL device id for MuJoCo offscreen rendering. With "
+            "CUDA_VISIBLE_DEVICES=7, the visible GPU is usually EGL device 0."
+        ),
+    )
+    parser.add_argument(
+        "--egl-import-device-id",
+        default=None,
+        help=(
+            "Temporary MUJOCO_EGL_DEVICE_ID used only while importing robosuite. "
+            "Some robosuite versions require this to match CUDA_VISIBLE_DEVICES "
+            "before CUDA remapping. Defaults to the first CUDA_VISIBLE_DEVICES entry."
+        ),
+    )
     parser.add_argument("--task-suite", default="libero_spatial")
     parser.add_argument("--task-id", default="0", help="Task id or `all`.")
     parser.add_argument("--config-name", default="sim_libero")
@@ -93,18 +127,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-inference-steps", type=int, default=20)
     parser.add_argument("--sigma-shift", type=float, default=None)
     parser.add_argument("--rand-device", default="cpu")
-    parser.add_argument("--dtype", default="bfloat16", choices=["float32", "float16", "bfloat16"])
+    parser.add_argument(
+        "--dtype", default="bfloat16", choices=["float32", "float16", "bfloat16"]
+    )
     parser.add_argument("--lambda-future", type=float, default=0.1)
     parser.add_argument("--current-frame-count", type=int, default=2)
     parser.add_argument("--future-frame-count", type=int, default=2)
     parser.add_argument("--num-future-tokens", type=int, default=256)
     parser.add_argument("--vjepa-dim", type=int, default=1408)
     parser.add_argument("--vjepa-model-name", default="vjepa2_vit_giant")
-    parser.add_argument("--binarize-gripper", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--binarize-gripper", action=argparse.BooleanOptionalAction, default=True
+    )
     return parser.parse_args()
 
 
-def resolve_path(path_value: str | None, *, base: Path = PROJECT_ROOT) -> Optional[Path]:
+def resolve_path(
+    path_value: str | None, *, base: Path = PROJECT_ROOT
+) -> Optional[Path]:
     if path_value is None:
         return None
     path = Path(os.path.expanduser(os.path.expandvars(str(path_value))))
@@ -121,13 +161,26 @@ def resolve_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
+def first_cuda_visible_device() -> Optional[str]:
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible_devices:
+        return None
+    for item in visible_devices.split(","):
+        item = item.strip()
+        if item and item != "-1":
+            return item
+    return None
+
+
 def compose_cfg(args: argparse.Namespace) -> DictConfig:
     from fastwam.utils.config_resolvers import register_default_resolvers
 
     register_default_resolvers()
     config_dir = (PROJECT_ROOT / "configs").resolve()
     with initialize_config_dir(config_dir=str(config_dir), version_base="1.3"):
-        cfg = compose(config_name=args.config_name, overrides=[f"task={args.config_task}"])
+        cfg = compose(
+            config_name=args.config_name, overrides=[f"task={args.config_task}"]
+        )
     cfg.EVALUATION.task_suite_name = args.task_suite
     cfg.EVALUATION.num_trials = int(args.num_episodes)
     cfg.EVALUATION.replan_steps = int(args.replan_steps)
@@ -157,7 +210,11 @@ def setup_logging(output_dir: Path) -> Path:
 
 
 def extract_action_state_dict(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
-    state = payload["mot"] if "mot" in payload and isinstance(payload["mot"], dict) else payload
+    state = (
+        payload["mot"]
+        if "mot" in payload and isinstance(payload["mot"], dict)
+        else payload
+    )
     prefixes = (
         "mixtures.action.",
         "dit.mixtures.action.",
@@ -197,7 +254,13 @@ def build_action_expert(
     return action_expert.to(device=device, dtype=dtype)
 
 
-def build_model(cfg: DictConfig, args: argparse.Namespace, *, device: torch.device, dtype: torch.dtype):
+def build_model(
+    cfg: DictConfig,
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+):
     from fastwam.models.vjepa import VJepaEncoderWrapper
     from fastwam.models.wan22.fastwam_jepa_joint import FastWAMJEPAJoint
 
@@ -239,7 +302,9 @@ def build_model(cfg: DictConfig, args: argparse.Namespace, *, device: torch.devi
         torch_dtype=dtype,
         action_train_shift=float(action_scheduler_cfg.get("train_shift", 5.0)),
         action_infer_shift=float(action_scheduler_cfg.get("infer_shift", 5.0)),
-        action_num_train_timesteps=int(action_scheduler_cfg.get("num_train_timesteps", 1000)),
+        action_num_train_timesteps=int(
+            action_scheduler_cfg.get("num_train_timesteps", 1000)
+        ),
         lambda_future=float(args.lambda_future),
         current_frame_count=int(args.current_frame_count),
         future_frame_count=int(args.future_frame_count),
@@ -252,12 +317,16 @@ def build_model(cfg: DictConfig, args: argparse.Namespace, *, device: torch.devi
 
 def strip_module_prefix(state_dict: dict[str, Any]) -> dict[str, Any]:
     return {
-        key[len("module.") :] if isinstance(key, str) and key.startswith("module.") else key: value
+        key[len("module.") :]
+        if isinstance(key, str) and key.startswith("module.")
+        else key: value
         for key, value in state_dict.items()
     }
 
 
-def load_jepa_checkpoint(model: torch.nn.Module, checkpoint_path: Path, *, device: torch.device) -> None:
+def load_jepa_checkpoint(
+    model: torch.nn.Module, checkpoint_path: Path, *, device: torch.device
+) -> None:
     payload = torch.load(checkpoint_path, map_location=device)
     if not isinstance(payload, dict):
         raise ValueError(f"JEPA checkpoint must be dict, got {type(payload)}.")
@@ -272,7 +341,9 @@ def load_jepa_checkpoint(model: torch.nn.Module, checkpoint_path: Path, *, devic
         state = payload
 
     if state is not None:
-        missing, unexpected = model.load_state_dict(strip_module_prefix(state), strict=False)
+        missing, unexpected = model.load_state_dict(
+            strip_module_prefix(state), strict=False
+        )
         logging.info("Loaded JEPA checkpoint: %s", checkpoint_path)
         logging.info("Missing keys: %s", list(missing))
         logging.info("Unexpected keys: %s", list(unexpected))
@@ -282,11 +353,20 @@ def load_jepa_checkpoint(model: torch.nn.Module, checkpoint_path: Path, *, devic
         return
 
     if "joint_predictor" in payload:
-        missing, unexpected = model.joint_predictor.load_state_dict(payload["joint_predictor"], strict=False)
+        missing, unexpected = model.joint_predictor.load_state_dict(
+            payload["joint_predictor"], strict=False
+        )
         logging.info("Loaded joint_predictor keys from %s", checkpoint_path)
-        logging.info("joint_predictor missing=%s unexpected=%s", list(missing), list(unexpected))
-        if payload.get("proprio_encoder") is not None and model.proprio_encoder is not None:
-            model.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=False)
+        logging.info(
+            "joint_predictor missing=%s unexpected=%s", list(missing), list(unexpected)
+        )
+        if (
+            payload.get("proprio_encoder") is not None
+            and model.proprio_encoder is not None
+        ):
+            model.proprio_encoder.load_state_dict(
+                payload["proprio_encoder"], strict=False
+            )
         return
 
     raise ValueError(
@@ -297,7 +377,9 @@ def load_jepa_checkpoint(model: torch.nn.Module, checkpoint_path: Path, *, devic
 
 def resolve_dataset_stats_path(cfg: DictConfig, args: argparse.Namespace) -> Path:
     candidates: list[Path] = []
-    explicit = resolve_path(args.dataset_stats_path) if args.dataset_stats_path else None
+    explicit = (
+        resolve_path(args.dataset_stats_path) if args.dataset_stats_path else None
+    )
     if explicit is not None:
         candidates.append(explicit)
     cfg_explicit = cfg.EVALUATION.get("dataset_stats_path")
@@ -323,7 +405,9 @@ def resolve_dataset_stats_path(cfg: DictConfig, args: argparse.Namespace) -> Pat
     )
 
 
-def load_cached_text_context(prompt: str, cfg: DictConfig) -> tuple[torch.Tensor, torch.Tensor]:
+def load_cached_text_context(
+    prompt: str, cfg: DictConfig
+) -> tuple[torch.Tensor, torch.Tensor]:
     cache_dir = cfg.data.train.get("text_embedding_cache_dir")
     if cache_dir is None:
         raise ValueError("cfg.data.train.text_embedding_cache_dir is required.")
@@ -364,6 +448,131 @@ def get_max_steps(task_suite_name: str, override: Optional[int]) -> int:
     return suite_steps[task_suite_name]
 
 
+def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarray:
+    pil_image = Image.fromarray(image)
+    src_w, src_h = pil_image.size
+    scale = max(width / src_w, height / src_h)
+    resized = pil_image.resize(
+        (round(src_w * scale), round(src_h * scale)),
+        resample=Image.BILINEAR,
+    )
+    rw, rh = resized.size
+    left = max((rw - width) // 2, 0)
+    top = max((rh - height) // 2, 0)
+    cropped = resized.crop((left, top, left + width, top + height))
+    return np.asarray(cropped, dtype=np.uint8)
+
+
+def _normalize_proprio(proprio: np.ndarray, processor) -> torch.Tensor:
+    state_meta = processor.shape_meta["state"]
+    if len(state_meta) != 1:
+        raise ValueError(
+            "LIBERO eval currently expects a single merged state key in shape_meta['state']."
+        )
+    state_key = state_meta[0]["key"]
+    state_batch = {
+        "state": {state_key: torch.as_tensor(proprio, dtype=torch.float32).unsqueeze(0)}
+    }
+    state_batch = processor.action_state_transform(state_batch)
+    state_batch = processor.normalizer.forward(state_batch)
+    return state_batch["state"][state_key]
+
+
+def _extract_sim_state(obs: dict) -> np.ndarray:
+    from experiments.libero.libero_utils import quat2axisangle
+
+    return np.concatenate(
+        (
+            obs["robot0_eef_pos"],
+            quat2axisangle(obs["robot0_eef_quat"]),
+            obs["robot0_gripper_qpos"],
+        )
+    ).astype(np.float32)
+
+
+def _obs_to_model_input(
+    obs: dict,
+    cfg: DictConfig,
+    processor,
+    width: int,
+    height: int,
+    device: str,
+    dtype: torch.dtype,
+):
+    from experiments.libero.libero_utils import get_libero_image
+
+    imgs = get_libero_image(obs)
+    image_meta = processor.shape_meta["images"]
+    if len(image_meta) < int(processor.num_output_cameras):
+        raise ValueError(
+            f"shape_meta.images has {len(image_meta)} entries, "
+            f"but num_output_cameras={processor.num_output_cameras}."
+        )
+
+    def _meta_to_hw(meta: dict, camera_idx: int) -> tuple[int, int]:
+        shape = meta["shape"]
+        if len(shape) != 3:
+            raise ValueError(
+                f"shape_meta.images[{camera_idx}].shape must be [C,H,W], got {shape}"
+            )
+        return int(shape[1]), int(shape[2])
+
+    concatenation = cfg.data.train.get("concat_multi_camera", "horizontal")
+    num_cameras = processor.num_output_cameras
+    if num_cameras == 1:
+        primary_h, primary_w = _meta_to_hw(image_meta[0], camera_idx=0)
+        rgb = _center_crop_resize(imgs["image"], width=primary_w, height=primary_h)
+    elif num_cameras == 2:
+        primary_h, primary_w = _meta_to_hw(image_meta[0], camera_idx=0)
+        wrist_h, wrist_w = _meta_to_hw(image_meta[1], camera_idx=1)
+        primary = _center_crop_resize(imgs["image"], width=primary_w, height=primary_h)
+        wrist = _center_crop_resize(imgs["wrist_image"], width=wrist_w, height=wrist_h)
+        if concatenation == "horizontal":
+            rgb = np.concatenate([primary, wrist], axis=1)
+        elif concatenation == "vertical":
+            rgb = np.concatenate([primary, wrist], axis=0)
+        else:
+            raise ValueError(f"Invalid concat_multi_camera: {concatenation}")
+    else:
+        raise ValueError(
+            f"LIBERO eval currently supports num_output_cameras in [1, 2], got {num_cameras}."
+        )
+
+    actual_h, actual_w = int(rgb.shape[0]), int(rgb.shape[1])
+    expected_h, expected_w = int(height), int(width)
+    image_shapes = [meta["shape"] for meta in image_meta]
+    assert actual_h == expected_h and actual_w == expected_w, (
+        "Input image size mismatch after per-camera resize + concat: "
+        f"got (H,W)=({actual_h},{actual_w}), expected (H,W)=({expected_h},{expected_w}) "
+        f"from data.train.video_size={[expected_h, expected_w]}; "
+        f"shape_meta.images={image_shapes}, concat_multi_camera={concatenation}."
+    )
+
+    x = torch.tensor(rgb).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype)
+    x = x * (2.0 / 255.0) - 1.0
+    proprio = _normalize_proprio(_extract_sim_state(obs), processor)
+    return x, proprio, imgs
+
+
+def _denormalize_action(action: torch.Tensor, processor) -> np.ndarray:
+    if action.ndim == 2:
+        action = action.unsqueeze(0)
+    if action.ndim != 3:
+        raise ValueError(f"Expected action tensor [B, T, D], got {tuple(action.shape)}")
+
+    action_meta = processor.shape_meta["action"]
+    if len(action_meta) != 1:
+        raise ValueError(
+            "LIBERO eval currently expects a single merged action key in shape_meta['action']."
+        )
+
+    action_key = action_meta[0]["key"]
+    normalizer = processor.normalizer.normalizers["action"][action_key]
+    action = action.to(dtype=torch.float32, device="cpu")
+    denorm = normalizer.backward(action)
+    return denorm.numpy()
+
+
 def run_episode(
     *,
     env,
@@ -381,7 +590,6 @@ def run_episode(
     episode_idx: int,
     video_dir: Path,
 ) -> dict[str, Any]:
-    from experiments.libero.eval_libero_single import _denormalize_action, _obs_to_model_input
     from experiments.libero.libero_utils import (
         get_libero_dummy_action,
         invert_gripper_action,
@@ -428,7 +636,9 @@ def run_episode(
                     proprio=proprio,
                     num_inference_steps=int(args.num_inference_steps),
                     sigma_shift=args.sigma_shift,
-                    seed=None if args.seed is None else int(args.seed) + int(episode_idx),
+                    seed=None
+                    if args.seed is None
+                    else int(args.seed) + int(episode_idx),
                     rand_device=str(args.rand_device),
                 )
                 action = _denormalize_action(pred["action"], processor)[0]
@@ -467,26 +677,54 @@ def run_episode(
 
 def main() -> None:
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    # LIBERO/robosuite imports MuJoCo during environment construction. On the
-    # training server we prefer EGL for headless GPU rendering; users can still
-    # override these from the shell before launching the script.
-    os.environ.setdefault("MUJOCO_GL", "egl")
-    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
     args = parse_args()
+    # LIBERO/robosuite imports MuJoCo during environment construction. Set these
+    # explicitly before importing LIBERO so an inherited shell value like
+    # MUJOCO_GL=osmesa cannot silently send headless eval down the wrong path.
+    # Some robosuite versions assert that MUJOCO_EGL_DEVICE_ID is one of the
+    # physical CUDA_VISIBLE_DEVICES during import, while MuJoCo EGL later expects
+    # the post-remapping local id. With CUDA_VISIBLE_DEVICES=7, that means import
+    # id 7 and runtime EGL id 0.
+    os.environ["MUJOCO_GL"] = str(args.mujoco_gl)
+    os.environ["PYOPENGL_PLATFORM"] = str(args.pyopengl_platform)
+    egl_import_device_id = None
+    if str(args.mujoco_gl) == "egl":
+        egl_import_device_id = (
+            str(args.egl_import_device_id)
+            if args.egl_import_device_id is not None
+            else first_cuda_visible_device()
+        )
+        if egl_import_device_id is None:
+            egl_import_device_id = str(int(args.egl_device_id))
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(egl_import_device_id)
     output_dir = resolve_path(args.output_dir)
     assert output_dir is not None
     log_path = setup_logging(output_dir)
+
+    from libero.libero import benchmark
 
     from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_env
     from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
     from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
     from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
     from fastwam.utils.pytorch_utils import set_global_seed
-    from libero.libero import benchmark
+
+    if str(args.mujoco_gl) == "egl":
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(int(args.egl_device_id))
+        logging.info(
+            "Using EGL rendering: import_device_id=%s runtime_device_id=%s CUDA_VISIBLE_DEVICES=%s",
+            egl_import_device_id,
+            os.environ["MUJOCO_EGL_DEVICE_ID"],
+            os.environ.get("CUDA_VISIBLE_DEVICES"),
+        )
 
     set_global_seed(int(args.seed), get_worker_init_fn=False)
     cfg = compose_cfg(args)
-    device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = torch.device(
+        args.device
+        if args.device != "auto"
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     dtype = resolve_dtype(args.dtype)
 
     logging.info("Building FastWAMJEPAJoint eval model")
@@ -501,7 +739,11 @@ def main() -> None:
     video_size = cfg.data.train.get("video_size", [224, 224])
     input_h = int(video_size[0])
     input_w = int(video_size[1])
-    action_horizon = int(args.action_horizon) if args.action_horizon else int(cfg.data.train.num_frames) - 1
+    action_horizon = (
+        int(args.action_horizon)
+        if args.action_horizon
+        else int(cfg.data.train.num_frames) - 1
+    )
 
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[str(args.task_suite)]()
@@ -518,8 +760,12 @@ def main() -> None:
         task = task_suite.get_task(task_id)
         initial_states = list(task_suite.get_task_init_states(task_id))
         while len(initial_states) < int(args.num_episodes):
-            initial_states.extend(initial_states[: int(args.num_episodes) - len(initial_states)])
-        env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, int(args.seed))
+            initial_states.extend(
+                initial_states[: int(args.num_episodes) - len(initial_states)]
+            )
+        env, task_description = get_libero_env(
+            task, LIBERO_ENV_RESOLUTION, int(args.seed)
+        )
         prompt = DEFAULT_PROMPT.format(task=task_description)
         context, context_mask = load_cached_text_context(prompt, cfg)
 
@@ -565,7 +811,11 @@ def main() -> None:
 
     success_count = sum(1 for item in all_episode_results if item["success"])
     total = len(all_episode_results)
-    avg_len = float(np.mean([item["length"] for item in all_episode_results])) if total else 0.0
+    avg_len = (
+        float(np.mean([item["length"] for item in all_episode_results]))
+        if total
+        else 0.0
+    )
     results = {
         "checkpoint": str(resolve_path(args.checkpoint)),
         "fastwam_base_checkpoint": str(resolve_path(args.fastwam_base_checkpoint)),
@@ -584,7 +834,9 @@ def main() -> None:
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, cls=NumpyEncoder)
     logging.info("Saved results to %s", results_path)
-    print(f"success_rate={results['success_rate']:.4f} avg_episode_length={avg_len:.2f}")
+    print(
+        f"success_rate={results['success_rate']:.4f} avg_episode_length={avg_len:.2f}"
+    )
     print(f"Saved results to {results_path}")
     print(f"Saved log to {log_path}")
 

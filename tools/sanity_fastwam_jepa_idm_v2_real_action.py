@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import sys
@@ -19,18 +19,29 @@ DEFAULT_ACTION_CHECKPOINT = (
     "/data1/Johnny/challenge/dd/FastWAM/runs/libero_joint_2cam224_1e-4/"
     "libero_joint_4gpu_20k_20260524_171732/checkpoints/weights/step_020000.pt"
 )
+DEFAULT_VJEPA_REPO = "/data1/Johnny/challenge/dd/FastWAM_jepa/external/vjepa2"
+DEFAULT_VJEPA_CHECKPOINT = (
+    "/data1/Johnny/challenge/dd/FastWAM_jepa/checkpoints/vjepa2/vitg.pt"
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Sanity check FastWAM-JEPA-IDM v2 with dummy V-JEPA tokens and a real "
-            "ActionDiT loaded from a FastWAM/FastWAM-IDM checkpoint."
+            "Sanity check FastWAM-JEPA-IDM v2 with real V-JEPA2 encoder tokens and "
+            "a real ActionDiT loaded from a FastWAM/FastWAM-IDM checkpoint."
         )
     )
     parser.add_argument("--config-name", default="train")
     parser.add_argument("--task", default="libero_joint_2cam224_1e-4")
     parser.add_argument("--action-checkpoint", default=DEFAULT_ACTION_CHECKPOINT)
+    parser.add_argument("--vjepa-repo", default=DEFAULT_VJEPA_REPO)
+    parser.add_argument("--vjepa-checkpoint", default=DEFAULT_VJEPA_CHECKPOINT)
+    parser.add_argument("--vjepa-model-name", default="vjepa2_vit_giant")
+    parser.add_argument("--vjepa-img-size", type=int, default=256)
+    parser.add_argument("--vjepa-input-range", default="-1_1", choices=["-1_1", "0_1"])
+    parser.add_argument("--vjepa-tubelet-size", type=int, default=2)
+    parser.add_argument("--freeze-vjepa", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--future-source", default="oracle", choices=["oracle", "predicted", "no_future"])
     parser.add_argument("--lambda-future", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -161,11 +172,26 @@ def build_model(
     from fastwam.models.wan22.fastwam_jepa_idm import FastWAMJEPAIDM
 
     proprio_dim = int(OmegaConf.select(cfg, "model.proprio_dim"))
+    vjepa_repo = resolve_path(args.vjepa_repo)
+    vjepa_checkpoint = resolve_path(args.vjepa_checkpoint)
+    if vjepa_repo is None:
+        raise ValueError("`--vjepa-repo` is required.")
+    if vjepa_checkpoint is None:
+        raise ValueError("`--vjepa-checkpoint` is required.")
+
     vjepa_encoder = VJepaEncoderWrapper(
-        dummy=True,
+        dummy=False,
         num_tokens=args.num_future_tokens,
         vjepa_dim=args.vjepa_dim,
-        freeze=True,
+        freeze=args.freeze_vjepa,
+        model_name=args.vjepa_model_name,
+        external_repo_path=str(vjepa_repo),
+        checkpoint_path=str(vjepa_checkpoint),
+        pretrained=False,
+        img_size=args.vjepa_img_size,
+        input_range=args.vjepa_input_range,
+        tubelet_size=args.vjepa_tubelet_size,
+        frame_encoding_mode="clip_or_repeat",
     )
     model = FastWAMJEPAIDM(
         action_expert=action_expert,
@@ -220,8 +246,12 @@ def main() -> None:
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype, device)
     checkpoint_path = resolve_path(args.action_checkpoint)
+    vjepa_repo = resolve_path(args.vjepa_repo)
+    vjepa_checkpoint = resolve_path(args.vjepa_checkpoint)
     if checkpoint_path is None:
         raise ValueError("`--action-checkpoint` is required.")
+    if vjepa_repo is None or vjepa_checkpoint is None:
+        raise ValueError("`--vjepa-repo` and `--vjepa-checkpoint` are required.")
 
     cfg = compose_cfg(args.config_name, args.task)
     action_cfg = OmegaConf.to_container(cfg.model.action_dit_config, resolve=True)
@@ -237,6 +267,7 @@ def main() -> None:
     action_expert.eval()
 
     block_calls = {"count": 0}
+    vjepa_forward_outputs: list[tuple[tuple[int, ...], bool]] = []
 
     def count_block_call(module, inputs, output) -> None:
         del module, inputs, output
@@ -252,6 +283,14 @@ def main() -> None:
             dtype=dtype,
         )
         model.eval()
+
+        def record_vjepa_output(module, inputs, output) -> None:
+            del module, inputs
+            if not isinstance(output, torch.Tensor):
+                raise RuntimeError(f"V-JEPA encoder output must be a tensor, got {type(output)}.")
+            vjepa_forward_outputs.append((tuple(output.shape), bool(output.requires_grad)))
+
+        handles.append(model.vjepa_encoder.register_forward_hook(record_vjepa_output))
         sample = build_sample(
             batch_size=args.batch_size,
             current_frame_count=args.current_frame_count,
@@ -265,8 +304,7 @@ def main() -> None:
             device=device,
             dtype=dtype,
         )
-        with torch.no_grad():
-            loss_total, loss_dict = model.training_loss(sample)
+        loss_total, loss_dict = model.training_loss(sample)
 
         if not torch.isfinite(loss_total):
             raise RuntimeError("loss_total is not finite.")
@@ -276,9 +314,30 @@ def main() -> None:
                 "ActionDiT.blocks call count mismatch: "
                 f"expected {expected_block_calls}, got {block_calls['count']}."
             )
+        if len(vjepa_forward_outputs) != 2:
+            raise RuntimeError(
+                "Expected exactly two V-JEPA encoder forwards "
+                f"(current and future), got {len(vjepa_forward_outputs)}."
+            )
+        if args.freeze_vjepa and any(requires_grad for _, requires_grad in vjepa_forward_outputs):
+            raise RuntimeError(
+                "freeze_vjepa=True but at least one V-JEPA encoder output still requires grad: "
+                f"{vjepa_forward_outputs}."
+            )
 
         shapes = model.last_forward_shapes
+        expected_jepa_shape = (args.batch_size, args.num_future_tokens, args.vjepa_dim)
+        for key in ("current_jepa_tokens", "target_future_jepa_tokens"):
+            if tuple(shapes[key]) != expected_jepa_shape:
+                raise RuntimeError(
+                    f"{key} shape must match dummy-compatible shape {expected_jepa_shape}, "
+                    f"got {shapes[key]}."
+                )
+
         print(f"checkpoint_path={checkpoint_path}")
+        print(f"vjepa_repo={vjepa_repo}")
+        print(f"vjepa_checkpoint={vjepa_checkpoint}")
+        print(f"freeze_vjepa={args.freeze_vjepa}")
         print(f"future_source={args.future_source}")
         print(f"loss_total={float(loss_total.detach().item()):.6f}")
         print(f"loss_action={loss_dict['loss_action']:.6f}")
@@ -292,6 +351,7 @@ def main() -> None:
         print(f"action_dit_text_dim={int(action_expert.text_dim)}")
         print(f"action_dit_action_dim={int(action_expert.action_dim)}")
         print(f"action_dit_num_blocks={expected_block_calls}")
+        print(f"vjepa_forward_outputs={vjepa_forward_outputs}")
     finally:
         for handle in handles:
             handle.remove()

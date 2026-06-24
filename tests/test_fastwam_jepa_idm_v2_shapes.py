@@ -86,7 +86,7 @@ class FakeActionExpertWithBlocks(nn.Module):
 
 def test_jepa_future_predictor_shapes():
     batch_size = 2
-    current_tokens = 6
+    current_tokens = 8
     future_tokens = 8
     vjepa_dim = 48
     hidden_dim = 64
@@ -108,13 +108,53 @@ def test_jepa_future_predictor_shapes():
         condition_mask=torch.ones(batch_size, text_len, dtype=torch.bool),
     )
 
+    assert not hasattr(predictor, "future_query_tokens")
     assert out["future_hidden_tokens"].shape == (batch_size, future_tokens, hidden_dim)
     assert out["pred_future_tokens"].shape == (batch_size, future_tokens, vjepa_dim)
+
+def test_jepa_future_predictor_loads_matching_vjepa2ac_trunk_keys():
+    predictor = JepaFuturePredictor(
+        vjepa_dim=48,
+        hidden_dim=64,
+        num_future_tokens=8,
+        text_dim=32,
+        num_layers=1,
+        num_heads=8,
+    )
+    block = predictor.predictor_blocks[0]
+    fake_vjepa2ac_state = {
+        "predictor.predictor_embed.weight": torch.randn_like(predictor.predictor_embed.weight),
+        "predictor.predictor_embed.bias": torch.randn_like(predictor.predictor_embed.bias),
+        "predictor.predictor_blocks.0.norm1.weight": torch.randn_like(block.norm_self.weight),
+        "predictor.predictor_blocks.0.norm1.bias": torch.randn_like(block.norm_self.bias),
+        "predictor.predictor_blocks.0.attn.qkv.weight": torch.randn_like(block.self_attn.qkv.weight),
+        "predictor.predictor_blocks.0.attn.qkv.bias": torch.randn_like(block.self_attn.qkv.bias),
+        "predictor.predictor_blocks.0.attn.proj.weight": torch.randn_like(block.self_attn.out.weight),
+        "predictor.predictor_blocks.0.attn.proj.bias": torch.randn_like(block.self_attn.out.bias),
+        "predictor.predictor_blocks.0.norm2.weight": torch.randn_like(block.norm_mlp.weight),
+        "predictor.predictor_blocks.0.norm2.bias": torch.randn_like(block.norm_mlp.bias),
+        "predictor.predictor_blocks.0.mlp.fc1.weight": torch.randn_like(block.mlp[0].weight),
+        "predictor.predictor_blocks.0.mlp.fc1.bias": torch.randn_like(block.mlp[0].bias),
+        "predictor.predictor_blocks.0.mlp.fc2.weight": torch.randn_like(block.mlp[3].weight),
+        "predictor.predictor_blocks.0.mlp.fc2.bias": torch.randn_like(block.mlp[3].bias),
+        "predictor.predictor_norm.weight": torch.randn_like(predictor.predictor_norm.weight),
+        "predictor.predictor_norm.bias": torch.randn_like(predictor.predictor_norm.bias),
+        "predictor.predictor_proj.weight": torch.randn_like(predictor.predictor_proj.weight),
+        "predictor.predictor_proj.bias": torch.randn_like(predictor.predictor_proj.bias),
+        "predictor.action_encoder.weight": torch.randn(64, 7),
+    }
+
+    stats = predictor.load_vjepa_ac_trunk_state_dict(fake_vjepa2ac_state)
+
+    assert stats["init_source"] == "vjepa2ac_pretrained"
+    assert stats["loaded_keys_count"] >= 18
+    assert "action_encoder.weight" in stats["skipped_keys"]
+    assert stats["loaded_params_count"] > 0
 
 
 def test_jepa_to_fastwam_adapter_shapes():
     batch_size = 2
-    current_tokens = 6
+    current_tokens = 8
     future_tokens = 8
     vjepa_dim = 48
     text_dim = 32

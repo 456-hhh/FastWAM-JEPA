@@ -273,23 +273,28 @@ class FastWAMJEPAIDM(nn.Module):
 
         current_jepa_tokens = self._encode_jepa_video(current_video)
         target_future_jepa_tokens = self._encode_jepa_video(future_video).detach()
-        future_out = self.future_predictor(
-            current_jepa_tokens=current_jepa_tokens,
-            condition_context=condition_context,
-            condition_mask=condition_mask,
-        )
-        pred_future_jepa_tokens = future_out["pred_future_tokens"]
-        if pred_future_jepa_tokens.shape != target_future_jepa_tokens.shape:
-            raise ValueError(
-                "`pred_future_jepa_tokens` shape must match target future tokens, "
-                f"got {tuple(pred_future_jepa_tokens.shape)} vs {tuple(target_future_jepa_tokens.shape)}."
-            )
 
-        if self.future_source == "oracle":
-            adapter_future_tokens = target_future_jepa_tokens
-        elif self.future_source == "predicted":
+        predictor_used = self.future_source == "predicted"
+        if predictor_used:
+            future_out = self.future_predictor(
+                current_jepa_tokens=current_jepa_tokens,
+                condition_context=condition_context,
+                condition_mask=condition_mask,
+            )
+            pred_future_jepa_tokens = future_out["pred_future_tokens"]
+            if pred_future_jepa_tokens.shape != target_future_jepa_tokens.shape:
+                raise ValueError(
+                    "`pred_future_jepa_tokens` shape must match target future tokens, "
+                    f"got {tuple(pred_future_jepa_tokens.shape)} vs {tuple(target_future_jepa_tokens.shape)}."
+                )
             adapter_future_tokens = pred_future_jepa_tokens
+        elif self.future_source == "oracle":
+            # Frozen oracle mode: use GT future V-JEPA tokens directly and do not
+            # execute the predictor. This is a baseline / supervision path.
+            pred_future_jepa_tokens = target_future_jepa_tokens.detach()
+            adapter_future_tokens = target_future_jepa_tokens
         elif self.future_source == "no_future":
+            pred_future_jepa_tokens = target_future_jepa_tokens.detach()
             adapter_future_tokens = None
         else:
             raise RuntimeError(f"Unexpected future_source={self.future_source!r}.")
@@ -326,6 +331,7 @@ class FastWAMJEPAIDM(nn.Module):
             "action_context": tuple(action_context.shape),
             "action_context_mask": tuple(action_context_mask.shape),
             "pred_action": tuple(pred_action.shape),
+            "predictor_used": "true" if predictor_used else "false",
         }
 
         action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
@@ -341,15 +347,22 @@ class FastWAMJEPAIDM(nn.Module):
             dtype=action_loss_per_sample.dtype,
         )
         loss_action = (action_loss_per_sample * action_weight).mean()
-        loss_future_jepa = F.smooth_l1_loss(
-            pred_future_jepa_tokens.float(),
-            target_future_jepa_tokens.float(),
-        )
+        if predictor_used:
+            loss_future_jepa = F.l1_loss(
+                pred_future_jepa_tokens.float(),
+                target_future_jepa_tokens.float(),
+            )
+        else:
+            loss_future_jepa = loss_action.new_zeros(())
         loss_total = self.lambda_action * loss_action + self.lambda_future * loss_future_jepa
+        loss_future_value = float(loss_future_jepa.detach().item())
         return loss_total, {
             "loss_total": float(loss_total.detach().item()),
             "loss_action": float(loss_action.detach().item()),
-            "loss_future_jepa": float(loss_future_jepa.detach().item()),
+            "loss_future_jepa": loss_future_value,
+            "loss_future": loss_future_value,
+            "loss_predictor": loss_future_value,
+            "oracle_vs_predicted_gap": loss_future_value,
         }
 
     def forward(self, *args, **kwargs):

@@ -131,7 +131,6 @@ class VJepaACJointPredictor(nn.Module):
         if ffn_dim <= 0:
             raise ValueError(f"`ffn_dim` must be positive, got {ffn_dim}.")
 
-        self.visual_adapter = nn.Linear(self.vjepa_dim, self.hidden_dim)
         self.future_query_tokens = nn.Parameter(
             torch.zeros(self.num_future_tokens, self.hidden_dim)
         )
@@ -150,7 +149,9 @@ class VJepaACJointPredictor(nn.Module):
         )
 
         self.condition_projection = (
-            nn.Linear(self.text_dim, self.hidden_dim) if self.text_dim is not None else None
+            nn.Linear(self.text_dim, self.hidden_dim)
+            if self.text_dim is not None
+            else None
         )
         self.future_feature_projection = nn.Linear(self.hidden_dim, self.vjepa_dim)
 
@@ -162,7 +163,9 @@ class VJepaACJointPredictor(nn.Module):
         batch_size: int,
     ) -> None:
         if condition_mask is not None and condition_context is None:
-            raise ValueError("`condition_mask` was provided without `condition_context`.")
+            raise ValueError(
+                "`condition_mask` was provided without `condition_context`."
+            )
         if condition_context is None:
             return
         if condition_context.ndim != 3:
@@ -253,7 +256,7 @@ class VJepaACJointPredictor(nn.Module):
         if action_tokens.ndim != 3:
             raise ValueError(
                 "`action_tokens` must be 3D with shape [B, T_a, D_h]. "
-                "Pass ActionDiT.pre_dit(...)[\"tokens\"], not raw noisy_action. "
+                'Pass ActionDiT.pre_dit(...)["tokens"], not raw noisy_action. '
                 f"Got shape {tuple(action_tokens.shape)}."
             )
         if action_tokens.shape[2] != self.hidden_dim:
@@ -277,10 +280,14 @@ class VJepaACJointPredictor(nn.Module):
         )
 
         visual_joint_tokens = self.visual_adapter(current_visual_tokens)
-        future_query_tokens = self.future_query_tokens.to(
-            device=action_tokens.device,
-            dtype=action_tokens.dtype,
-        ).unsqueeze(0).expand(batch_size, -1, -1)
+        future_query_tokens = (
+            self.future_query_tokens.to(
+                device=action_tokens.device,
+                dtype=action_tokens.dtype,
+            )
+            .unsqueeze(0)
+            .expand(batch_size, -1, -1)
+        )
 
         # Main tokens are visual + future query + action only. Text/proprio are
         # condition inputs and are not concatenated into this sequence.

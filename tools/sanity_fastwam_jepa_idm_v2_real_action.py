@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vjepa-tubelet-size", type=int, default=2)
     parser.add_argument("--freeze-vjepa", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--future-source", default="oracle", choices=["oracle", "predicted", "no_future"])
-    parser.add_argument("--predictor-checkpoint", default=None)
+    parser.add_argument("--predictor-checkpoint", default=None, help="V-JEPA2-AC predictor checkpoint for partial pretrained init.")
     parser.add_argument(
         "--allow-random-predictor",
         action="store_true",
@@ -255,39 +255,6 @@ def build_model(
     return model.to(device=device, dtype=dtype)
 
 
-def strip_module_prefix(state_dict: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key[len("module.") :] if isinstance(key, str) and key.startswith("module.") else key: value
-        for key, value in state_dict.items()
-    }
-
-
-def extract_predictor_state_dict(payload: dict[str, Any]) -> dict[str, Any]:
-    for key in ("future_predictor", "predictor", "predictor_state_dict"):
-        value = payload.get(key)
-        if isinstance(value, dict):
-            return strip_module_prefix(value)
-
-    for state_key in ("model", "model_state_dict", "state_dict"):
-        state = payload.get(state_key)
-        if isinstance(state, dict):
-            filtered = {}
-            for key, value in strip_module_prefix(state).items():
-                if isinstance(key, str) and key.startswith("future_predictor."):
-                    filtered[key[len("future_predictor.") :]] = value
-            if filtered:
-                return filtered
-
-    if payload and all(torch.is_tensor(value) for value in payload.values()):
-        return strip_module_prefix(payload)
-
-    raise ValueError(
-        "Could not find JepaFuturePredictor weights. Expected `future_predictor`, "
-        "`predictor`, `predictor_state_dict`, a full model state with "
-        "`future_predictor.*`, or a bare predictor state_dict."
-    )
-
-
 def load_predictor_checkpoint(
     *,
     model: torch.nn.Module,
@@ -296,6 +263,7 @@ def load_predictor_checkpoint(
     allow_random_predictor: bool,
     device: torch.device,
 ) -> tuple[str, dict[str, Any] | None]:
+    del device
     if future_source in {"oracle", "no_future"}:
         return f"unused_{future_source}_gt_future", None
 
@@ -303,24 +271,28 @@ def load_predictor_checkpoint(
         if allow_random_predictor:
             return "random_init_debug_explicit", None
         raise ValueError(
-            "future_source='predicted' requires --predictor-checkpoint. "
+            "future_source='predicted' requires --predictor-checkpoint for V-JEPA2-AC partial init. "
             "For debug-only random init, pass --allow-random-predictor explicitly."
         )
     if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Predictor checkpoint does not exist: {checkpoint_path}")
+        raise FileNotFoundError(f"V-JEPA2-AC predictor checkpoint does not exist: {checkpoint_path}")
 
-    payload = torch.load(checkpoint_path, map_location=device)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Predictor checkpoint must be a dict, got {type(payload)}.")
-    state = extract_predictor_state_dict(payload)
-    missing, unexpected = model.future_predictor.load_state_dict(state, strict=True)
-    if missing or unexpected:
+    # Training and eval ablations must share the exact same V-JEPA2-AC predictor
+    # mapping, skip rules, strict=False partial loading, and shape-mismatch logging.
+    # Do not torch.load a predictor state_dict here and assign it directly.
+    stats = model.future_predictor.load_vjepa2ac_predictor_weights(checkpoint_path)
+    if int(stats.get("loaded_keys_count", 0)) <= 0:
         raise RuntimeError(
-            "Unexpected predictor load_state_dict result with strict=True: "
-            f"missing={missing}, unexpected={unexpected}."
+            "V-JEPA2-AC predictor checkpoint did not load any compatible keys. "
+            f"stats={stats}"
         )
-    step = payload.get("step", "unknown")
-    return f"loaded_checkpoint:{checkpoint_path}:step={step}", payload
+    return (
+        "vjepa2ac_pretrained_init:"
+        f"{checkpoint_path}:loaded_keys={stats.get('loaded_keys_count')}:"
+        f"skipped_keys={stats.get('skipped_keys_count')}:"
+        f"shape_mismatch={stats.get('shape_mismatch_count')}",
+        {"vjepa2ac_load_stats": stats},
+    )
 
 
 def save_predictor_checkpoint(
@@ -473,11 +445,11 @@ def main() -> None:
     if args.train_predictor and args.predictor_checkpoint is None and not args.allow_random_predictor:
         raise ValueError(
             "Stage B training needs a reproducible predictor source. Pass --predictor-checkpoint "
-            "to resume/load, or --allow-random-predictor for explicit debug random init."
+            "for V-JEPA2-AC partial pretrained init, or --allow-random-predictor for explicit debug random init."
         )
     if (not args.train_predictor) and args.future_source == "predicted" and args.predictor_checkpoint is None:
         raise ValueError(
-            "Predicted/eval mode requires --predictor-checkpoint. Random predictor eval is forbidden."
+            "Predicted/eval mode requires --predictor-checkpoint for V-JEPA2-AC partial init. Random predictor eval is forbidden."
         )
     if args.steps <= 0:
         raise ValueError(f"`--steps` must be positive, got {args.steps}.")

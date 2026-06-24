@@ -412,6 +412,10 @@ class JepaFuturePredictor(nn.Module):
             # Official SwiGLU checkpoints use fc1/fc2/fc3. This predictor uses
             # a standard GELU MLP, so fc3 cannot be mapped safely.
             return None
+        if mapped.startswith("norm."):
+            return "predictor_norm." + mapped[len("norm.") :]
+        if mapped.startswith("proj."):
+            return "predictor_proj." + mapped[len("proj.") :]
         return mapped
 
     def _load_partial_vjepa2ac_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, Any]:

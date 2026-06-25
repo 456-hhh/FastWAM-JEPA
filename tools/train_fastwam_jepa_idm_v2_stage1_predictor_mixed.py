@@ -1,0 +1,820 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import sys
+import time
+from collections import Counter
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from hydra import compose, initialize_config_dir
+from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+TOOLS_ROOT = PROJECT_ROOT / "tools"
+for path in (SRC_ROOT, PROJECT_ROOT, TOOLS_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from fastwam_jepa_runtime_guard import configure_runtime_stability
+
+DEFAULT_VJEPA_REPO = "/data1/Johnny/challenge/dd/FastWAM_jepa/external/vjepa2"
+DEFAULT_VJEPA_CHECKPOINT = (
+    "/data1/Johnny/challenge/dd/FastWAM_jepa/checkpoints/vjepa2/vitg.pt"
+)
+
+
+class InfiniteSourceIterator:
+    def __init__(self, *, name: str, dataset, num_workers: int, seed: int) -> None:
+        self.name = str(name)
+        self.dataset = dataset
+        self.num_workers = int(num_workers)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.iterator = self._new_iterator()
+
+    def _new_iterator(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        loader = DataLoader(
+            self.dataset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=False,
+            collate_fn=lambda batch: batch[0],
+            generator=generator,
+        )
+        self.epoch += 1
+        return iter(loader)
+
+    def next(self) -> dict[str, Any]:
+        try:
+            sample = next(self.iterator)
+        except StopIteration:
+            self.iterator = self._new_iterator()
+            sample = next(self.iterator)
+        if not isinstance(sample, dict):
+            raise ValueError(
+                f"Dataset {self.name!r} returned {type(sample)}, expected dict."
+            )
+        sample = dict(sample)
+        sample["dataset_name"] = self.name
+        return sample
+
+
+class MixedDemoBatcher:
+    def __init__(
+        self,
+        *,
+        sources: dict[str, InfiniteSourceIterator],
+        weights: dict[str, float],
+        batch_size: int,
+        video_size: int,
+        seed: int,
+        use_proprio: bool,
+    ) -> None:
+        self.sources = sources
+        self.weights = normalize_mix(weights)
+        self.batch_size = int(batch_size)
+        self.video_size = int(video_size)
+        self.rng = random.Random(int(seed))
+        self.use_proprio = bool(use_proprio)
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {self.batch_size}.")
+
+    def next_batch(self) -> dict[str, Any]:
+        names = list(self.weights.keys())
+        probs = [self.weights[name] for name in names]
+        samples = [
+            self.sources[self.rng.choices(names, weights=probs, k=1)[0]].next()
+            for _ in range(self.batch_size)
+        ]
+        return collate_stage1_samples(
+            samples, video_size=self.video_size, use_proprio=self.use_proprio
+        )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Stage 1 target-domain JEPA latent predictor pretraining for FastWAM-JEPA-IDM v2. "
+            "Only trains JepaFuturePredictor and condition modules; V-JEPA2 and ActionDiT stay frozen/unused."
+        )
+    )
+    parser.add_argument("--config-name", default="train")
+    parser.add_argument("--libero-task", default="libero_joint_2cam224_1e-4")
+    parser.add_argument("--robotwin-task", default="robotwin_joint_3cam_384_1e-4")
+    parser.add_argument("--libero-data-root", default=None)
+    parser.add_argument("--robotwin-data-root", default=None)
+    parser.add_argument("--dataset-mix", default="libero:0.5,robotwin:0.5")
+    parser.add_argument("--vjepa-repo", default=DEFAULT_VJEPA_REPO)
+    parser.add_argument("--vjepa-checkpoint", default=DEFAULT_VJEPA_CHECKPOINT)
+    parser.add_argument("--vjepa2ac-checkpoint", default=None)
+    parser.add_argument("--vjepa-model-name", default="vjepa2_vit_giant")
+    parser.add_argument("--vjepa-img-size", type=int, default=256)
+    parser.add_argument("--vjepa-input-range", default="-1_1", choices=["-1_1", "0_1"])
+    parser.add_argument("--vjepa-tubelet-size", type=int, default=2)
+    parser.add_argument("--vjepa-dim", type=int, default=1408)
+    parser.add_argument("--hidden-dim", type=int, default=1408)
+    parser.add_argument("--num-future-tokens", type=int, default=256)
+    parser.add_argument("--future-predictor-layers", type=int, default=6)
+    parser.add_argument("--future-predictor-heads", type=int, default=8)
+    parser.add_argument("--adapter-current-tokens", type=int, default=16)
+    parser.add_argument("--adapter-future-tokens", type=int, default=16)
+    parser.add_argument("--current-frame-count", type=int, default=2)
+    parser.add_argument("--future-frame-count", type=int, default=2)
+    parser.add_argument(
+        "--video-size",
+        type=int,
+        default=256,
+        help="Common pre-batch H/W used for mixed-source collation.",
+    )
+    parser.add_argument("--steps", type=int, default=10000)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1.0e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--lambda-cos", type=float, default=0.0)
+    parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument(
+        "--output-dir", default="runs/fastwam_jepa_idm_v2_stage1_predictor_mixed"
+    )
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--precision", default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use-proprio", action="store_true", default=False)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--disable-wsl-fallback", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--runtime-log-level",
+        default="INFO",
+        choices=["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+    )
+    parser.add_argument("--runtime-log-path", default=None)
+    parser.add_argument("--runtime-log-max-mb", type=int, default=100)
+    return parser.parse_args()
+
+
+def resolve_path(path_value: str | None, *, base: Path = PROJECT_ROOT) -> Path | None:
+    if path_value is None:
+        return None
+    path = Path(path_value)
+    return path.resolve() if path.is_absolute() else (base / path).resolve()
+
+
+def require_dir(path_value: str | None, *, name: str) -> Path:
+    path = resolve_path(path_value)
+    if path is None:
+        raise ValueError(f"{name} is required for the selected dataset mix.")
+    if not path.exists():
+        raise FileNotFoundError(f"{name} does not exist: {path}")
+    if not path.is_dir():
+        raise FileNotFoundError(f"{name} is not a directory: {path}")
+    return path
+
+
+def require_file(path_value: str | None, *, name: str) -> Path:
+    path = resolve_path(path_value)
+    if path is None:
+        raise ValueError(f"{name} is required.")
+    if not path.exists():
+        raise FileNotFoundError(f"{name} does not exist: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"{name} is not a file: {path}")
+    return path
+
+
+def compose_cfg(config_name: str, task: str) -> DictConfig:
+    from fastwam.utils.config_resolvers import register_default_resolvers
+
+    register_default_resolvers()
+    config_dir = (PROJECT_ROOT / "configs").resolve()
+    with initialize_config_dir(config_dir=str(config_dir), version_base="1.3"):
+        return compose(config_name=config_name, overrides=[f"task={task}"])
+
+
+def parse_dataset_mix(mix: str) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for item in str(mix).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                f"Invalid --dataset-mix item {item!r}; expected name:weight."
+            )
+        name, value = item.split(":", 1)
+        name = name.strip().lower()
+        if name not in {"libero", "robotwin"}:
+            raise ValueError(
+                f"Unsupported dataset source {name!r}; expected libero or robotwin."
+            )
+        weight = float(value)
+        if weight < 0.0:
+            raise ValueError(
+                f"Dataset weight must be non-negative, got {name}:{weight}."
+            )
+        if weight > 0.0:
+            result[name] = weight
+    if not result:
+        raise ValueError(
+            "--dataset-mix must contain at least one source with positive weight."
+        )
+    return normalize_mix(result)
+
+
+def normalize_mix(weights: dict[str, float]) -> dict[str, float]:
+    total = float(sum(weights.values()))
+    if total <= 0.0:
+        raise ValueError(f"Dataset weights must sum to > 0, got {weights}.")
+    return {
+        name: float(value) / total
+        for name, value in weights.items()
+        if float(value) > 0.0
+    }
+
+
+def resolve_dataset_dirs_from_cfg(
+    cfg: DictConfig, *, override_root: str | None, source: str
+) -> list[str]:
+    if override_root is not None:
+        root = require_dir(override_root, name=f"--{source}-data-root")
+        if source == "libero":
+            candidates = sorted(
+                path
+                for path in root.iterdir()
+                if path.is_dir() and path.name.endswith("_lerobot")
+            )
+            if candidates:
+                return [str(path.resolve()) for path in candidates]
+        return [str(root.resolve())]
+
+    dataset_dirs = cfg.data.train.get("dataset_dirs")
+    if dataset_dirs is None:
+        raise ValueError(f"cfg.data.train.dataset_dirs is required for {source}.")
+    resolved: list[str] = []
+    for dataset_dir in dataset_dirs:
+        path = Path(str(dataset_dir))
+        abs_path = (
+            path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+        )
+        if not abs_path.exists():
+            raise FileNotFoundError(
+                f"{source} dataset directory does not exist: {abs_path}. "
+                f"Pass --{source}-data-root to override."
+            )
+        if not abs_path.is_dir():
+            raise FileNotFoundError(
+                f"{source} dataset path is not a directory: {abs_path}"
+            )
+        resolved.append(str(abs_path))
+    return resolved
+
+
+def build_source_dataset(*, source: str, args: argparse.Namespace):
+    task = args.libero_task if source == "libero" else args.robotwin_task
+    cfg = compose_cfg(args.config_name, task)
+    override_root = (
+        args.libero_data_root if source == "libero" else args.robotwin_data_root
+    )
+    dataset_dirs = resolve_dataset_dirs_from_cfg(
+        cfg, override_root=override_root, source=source
+    )
+    cfg.data.train.dataset_dirs = dataset_dirs
+    print(f"{source}_dataset_dirs={dataset_dirs}", flush=True)
+    dataset = instantiate(cfg.data.train)
+    print(f"{source}_dataset={type(dataset).__name__} len={len(dataset)}", flush=True)
+    return dataset
+
+
+def resize_video(video: torch.Tensor, *, size: int) -> torch.Tensor:
+    if video.ndim != 4 or video.shape[0] != 3:
+        raise ValueError(f"video must be [3, T, H, W], got {tuple(video.shape)}.")
+    if int(video.shape[-2]) == int(size) and int(video.shape[-1]) == int(size):
+        return video
+    x = video.permute(1, 0, 2, 3).float()
+    x = F.interpolate(
+        x, size=(int(size), int(size)), mode="bilinear", align_corners=False
+    )
+    return x.to(dtype=video.dtype).permute(1, 0, 2, 3)
+
+
+def maybe_stack_tensors(values: list[Any], *, key: str) -> torch.Tensor | None:
+    if not all(torch.is_tensor(value) for value in values):
+        return None
+    shapes = [tuple(value.shape) for value in values]
+    if len(set(shapes)) != 1:
+        print(f"batch_{key}_not_stacked_due_to_shape_mismatch={shapes}", flush=True)
+        return None
+    return torch.stack(values, dim=0)
+
+
+def collate_stage1_samples(
+    samples: list[dict[str, Any]], *, video_size: int, use_proprio: bool
+) -> dict[str, Any]:
+    videos = []
+    contexts = []
+    context_masks = []
+    actions = []
+    proprios = []
+    dataset_names = []
+    prompts = []
+    for sample in samples:
+        dataset_name = str(sample.get("dataset_name", "unknown"))
+        dataset_names.append(dataset_name)
+        prompts.append(sample.get("prompt"))
+
+        video = sample.get("video")
+        context = sample.get("context")
+        context_mask = sample.get("context_mask")
+        if not torch.is_tensor(video):
+            raise ValueError(f"{dataset_name} sample is missing tensor video.")
+        if not torch.is_tensor(context) or not torch.is_tensor(context_mask):
+            raise ValueError(
+                f"{dataset_name} sample is missing context/context_mask tensors."
+            )
+        videos.append(resize_video(video, size=video_size))
+        contexts.append(context)
+        context_masks.append(context_mask.bool())
+        actions.append(sample.get("action"))
+        proprios.append(sample.get("proprio"))
+
+    video_batch = torch.stack(videos, dim=0)
+    context_batch = maybe_stack_tensors(contexts, key="context")
+    mask_batch = maybe_stack_tensors(context_masks, key="context_mask")
+    if context_batch is None or mask_batch is None:
+        raise ValueError(
+            "Mixed dataset context/context_mask shapes must match exactly; no silent projection is applied."
+        )
+
+    action_batch = maybe_stack_tensors(actions, key="action")
+    proprio_batch = maybe_stack_tensors(proprios, key="proprio")
+    if use_proprio and proprio_batch is None:
+        raise ValueError(
+            "--use-proprio requires all mixed sources to have matching proprio tensor shapes."
+        )
+
+    return {
+        "video": video_batch,
+        "context": context_batch,
+        "context_mask": mask_batch,
+        "proprio": proprio_batch if use_proprio else None,
+        "action": action_batch,
+        "dataset_name": dataset_names,
+        "prompt": prompts,
+        "source_counts": dict(Counter(dataset_names)),
+    }
+
+
+def resolve_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def precision_to_dtype(
+    precision: str, device: torch.device
+) -> tuple[torch.dtype, torch.dtype | None]:
+    if precision == "fp32":
+        return torch.float32, None
+    if precision == "bf16":
+        return (
+            torch.bfloat16 if device.type == "cuda" else torch.float32,
+            torch.bfloat16 if device.type == "cuda" else None,
+        )
+    if precision == "fp16":
+        return (
+            torch.float16 if device.type == "cuda" else torch.float32,
+            torch.float16 if device.type == "cuda" else None,
+        )
+    raise ValueError(f"Unsupported precision: {precision}")
+
+
+def move_batch(
+    batch: dict[str, Any], *, device: torch.device, dtype: torch.dtype
+) -> dict[str, Any]:
+    moved = dict(batch)
+    for key in ("video", "context"):
+        value = moved.get(key)
+        if torch.is_tensor(value):
+            moved[key] = value.to(device=device, dtype=dtype, non_blocking=True)
+    mask = moved.get("context_mask")
+    if torch.is_tensor(mask):
+        moved["context_mask"] = mask.to(
+            device=device, dtype=torch.bool, non_blocking=True
+        )
+    proprio = moved.get("proprio")
+    if torch.is_tensor(proprio):
+        moved["proprio"] = proprio.to(device=device, dtype=dtype, non_blocking=True)
+    return moved
+
+
+def build_condition(
+    *,
+    context: torch.Tensor,
+    context_mask: torch.Tensor,
+    proprio: torch.Tensor | None,
+    proprio_encoder: torch.nn.Module | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if proprio_encoder is None or proprio is None:
+        return context, context_mask
+    if proprio.ndim == 3:
+        proprio = proprio[:, 0, :]
+    elif proprio.ndim != 2:
+        raise ValueError(
+            f"proprio must be [B, D_p] or [B, T, D_p], got {tuple(proprio.shape)}."
+        )
+    proprio_token = proprio_encoder(proprio).unsqueeze(1)
+    proprio_mask = torch.ones(
+        (context.shape[0], 1), device=context.device, dtype=torch.bool
+    )
+    return torch.cat([context, proprio_token], dim=1), torch.cat(
+        [context_mask, proprio_mask], dim=1
+    )
+
+
+def build_modules(
+    *,
+    args: argparse.Namespace,
+    text_dim: int,
+    proprio_dim: int | None,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    from fastwam.models.vjepa.jepa_fastwam_adapter import JepaToFastWAMAdapter
+    from fastwam.models.vjepa.jepa_future_predictor import JepaFuturePredictor
+    from fastwam.models.vjepa.vjepa_encoder_wrapper import VJepaEncoderWrapper
+
+    vjepa_encoder = VJepaEncoderWrapper(
+        dummy=False,
+        model_name=str(args.vjepa_model_name),
+        external_repo_path=str(require_dir(args.vjepa_repo, name="--vjepa-repo")),
+        checkpoint_path=str(
+            require_file(args.vjepa_checkpoint, name="--vjepa-checkpoint")
+        ),
+        pretrained=False,
+        vjepa_dim=int(args.vjepa_dim),
+        num_tokens=int(args.num_future_tokens),
+        freeze=True,
+        normalize_tokens=False,
+        img_size=int(args.vjepa_img_size),
+        input_range=str(args.vjepa_input_range),
+        tubelet_size=int(args.vjepa_tubelet_size),
+        frame_encoding_mode="clip_or_repeat",
+    ).to(device=device, dtype=dtype)
+    vjepa_encoder.eval()
+    vjepa_encoder.requires_grad_(False)
+
+    predictor = JepaFuturePredictor(
+        vjepa_dim=int(args.vjepa_dim),
+        hidden_dim=int(args.hidden_dim),
+        num_future_tokens=int(args.num_future_tokens),
+        text_dim=int(text_dim),
+        num_layers=int(args.future_predictor_layers),
+        num_heads=int(args.future_predictor_heads),
+    ).to(device=device, dtype=dtype)
+
+    adapter = JepaToFastWAMAdapter(
+        vjepa_dim=int(args.vjepa_dim),
+        text_dim=int(text_dim),
+        num_current_context_tokens=int(args.adapter_current_tokens),
+        num_future_context_tokens=int(args.adapter_future_tokens),
+    ).to(device=device, dtype=dtype)
+
+    proprio_encoder = None
+    if args.use_proprio:
+        if proprio_dim is None:
+            raise ValueError(
+                "--use-proprio was set but the first mixed batch has no stacked proprio tensor."
+            )
+        proprio_encoder = torch.nn.Linear(int(proprio_dim), int(text_dim)).to(
+            device=device, dtype=dtype
+        )
+
+    load_stats: dict[str, Any] | None = None
+    if args.vjepa2ac_checkpoint is not None:
+        ckpt_path = require_file(args.vjepa2ac_checkpoint, name="--vjepa2ac-checkpoint")
+        load_stats = predictor.load_vjepa2ac_predictor_weights(ckpt_path)
+        if int(load_stats.get("loaded_keys_count", 0)) <= 0:
+            raise RuntimeError(
+                f"V-JEPA2-AC predictor init loaded no compatible keys: {load_stats}"
+            )
+    else:
+        load_stats = {
+            "init_source": "random_init_no_vjepa2ac_checkpoint",
+            "loaded_keys_count": 0,
+            "skipped_keys_count": 0,
+            "shape_mismatch_count": 0,
+        }
+        print("V-JEPA2-AC predictor init skipped: random init", flush=True)
+
+    return vjepa_encoder, predictor, adapter, proprio_encoder, load_stats
+
+
+def encode_videos(
+    vjepa_encoder: torch.nn.Module,
+    video: torch.Tensor,
+    *,
+    current_frames: int,
+    future_frames: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if video.ndim != 5 or video.shape[1] != 3:
+        raise ValueError(f"video must be [B, 3, T, H, W], got {tuple(video.shape)}.")
+    required = int(current_frames) + int(future_frames)
+    if int(video.shape[2]) < required:
+        raise ValueError(f"video has T={video.shape[2]}, required at least {required}.")
+    current_video = video[:, :, : int(current_frames)]
+    future_video = video[:, :, int(current_frames) : required]
+    with torch.no_grad():
+        current_tokens = vjepa_encoder(current_video)
+        target_future_tokens = vjepa_encoder(future_video).detach()
+    return current_tokens, target_future_tokens
+
+
+def future_cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return 1.0 - F.cosine_similarity(pred.float(), target.float(), dim=-1).mean()
+
+
+def source_counts_to_str(counts: dict[str, int]) -> str:
+    return ",".join(f"{name}:{counts[name]}" for name in sorted(counts))
+
+
+def save_checkpoint(
+    *,
+    output_dir: Path,
+    predictor: torch.nn.Module,
+    adapter: torch.nn.Module,
+    proprio_encoder: torch.nn.Module | None,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    args: argparse.Namespace,
+    load_stats: dict[str, Any] | None,
+    loss_dict: dict[str, float],
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"checkpoint_step_{int(step):06d}.pt"
+    payload = {
+        "future_predictor": predictor.state_dict(),
+        "jepa_adapter": adapter.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": int(step),
+        "config": vars(args),
+        "vjepa2ac_load_stats": load_stats,
+        "loss_dict": dict(loss_dict),
+    }
+    if proprio_encoder is not None:
+        payload["proprio_encoder"] = proprio_encoder.state_dict()
+    torch.save(payload, path)
+    return path
+
+
+def main() -> None:
+    args = parse_args()
+    runtime_status = configure_runtime_stability(
+        disable_wsl_fallback=args.disable_wsl_fallback,
+        log_level=args.runtime_log_level,
+        log_path=args.runtime_log_path,
+        max_log_mb=args.runtime_log_max_mb,
+    )
+    print(f"runtime_safe_mode={runtime_status['safe_mode']}", flush=True)
+    print(
+        f"runtime_disable_wsl_fallback={runtime_status['disable_wsl_fallback']}",
+        flush=True,
+    )
+    print(f"runtime_log_level={runtime_status['log_level']}", flush=True)
+
+    if int(args.steps) <= 0:
+        raise ValueError(f"--steps must be positive, got {args.steps}.")
+    if int(args.batch_size) <= 0:
+        raise ValueError(f"--batch-size must be positive, got {args.batch_size}.")
+    if float(args.lambda_cos) < 0.0:
+        raise ValueError(f"--lambda-cos must be non-negative, got {args.lambda_cos}.")
+
+    torch.manual_seed(int(args.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
+    device = resolve_device()
+    param_dtype, autocast_dtype = precision_to_dtype(str(args.precision), device)
+    output_dir = resolve_path(args.output_dir)
+    if output_dir is None:
+        raise ValueError("--output-dir is required.")
+
+    mix = parse_dataset_mix(args.dataset_mix)
+    print(f"dataset_sampling_ratio={mix}", flush=True)
+
+    datasets = {
+        source: build_source_dataset(source=source, args=args) for source in mix
+    }
+    sources = {
+        source: InfiniteSourceIterator(
+            name=source,
+            dataset=dataset,
+            num_workers=int(args.num_workers),
+            seed=int(args.seed) + idx * 1009,
+        )
+        for idx, (source, dataset) in enumerate(datasets.items())
+    }
+    batcher = MixedDemoBatcher(
+        sources=sources,
+        weights=mix,
+        batch_size=int(args.batch_size),
+        video_size=int(args.video_size),
+        seed=int(args.seed),
+        use_proprio=bool(args.use_proprio),
+    )
+
+    first_batch = batcher.next_batch()
+    text_dim = int(first_batch["context"].shape[-1])
+    proprio_tensor = first_batch.get("proprio")
+    proprio_dim = (
+        int(proprio_tensor.shape[-1]) if torch.is_tensor(proprio_tensor) else None
+    )
+    print(f"inferred_text_dim={text_dim}", flush=True)
+    print(f"inferred_proprio_dim={proprio_dim}", flush=True)
+    print(f"first_batch_source_counts={first_batch['source_counts']}", flush=True)
+    print(f"first_batch_video_shape={tuple(first_batch['video'].shape)}", flush=True)
+    print(
+        f"first_batch_context_shape={tuple(first_batch['context'].shape)}", flush=True
+    )
+
+    vjepa_encoder, predictor, adapter, proprio_encoder, load_stats = build_modules(
+        args=args,
+        text_dim=text_dim,
+        proprio_dim=proprio_dim,
+        device=device,
+        dtype=param_dtype,
+    )
+    predictor.train()
+    adapter.eval()
+    adapter.requires_grad_(False)
+    train_modules: list[torch.nn.Module] = [predictor]
+    if proprio_encoder is not None:
+        train_modules.append(proprio_encoder)
+    # The adapter is saved for downstream FastWAM context use. Stage 1 does not
+    # consume adapter outputs, so it is frozen here; predictor.condition_projection
+    # is trained as the active condition adapter.
+    trainable_params = [
+        param
+        for module in train_modules
+        for param in module.parameters()
+        if param.requires_grad
+    ]
+    optimizer = torch.optim.AdamW(
+        trainable_params, lr=float(args.lr), weight_decay=float(args.weight_decay)
+    )
+
+    print(
+        "vjepa2ac_init_stats "
+        f"loaded_keys_count={load_stats.get('loaded_keys_count')} "
+        f"skipped_keys_count={load_stats.get('skipped_keys_count')} "
+        f"shape_mismatch_count={load_stats.get('shape_mismatch_count')} "
+        f"init_source={load_stats.get('init_source')}",
+        flush=True,
+    )
+    print(
+        f"trainable_predictor_params={sum(p.numel() for p in predictor.parameters() if p.requires_grad)}",
+        flush=True,
+    )
+    print(
+        f"saved_frozen_adapter_params={sum(p.numel() for p in adapter.parameters())}",
+        flush=True,
+    )
+    print(
+        f"trainable_proprio_encoder_params={0 if proprio_encoder is None else sum(p.numel() for p in proprio_encoder.parameters() if p.requires_grad)}",
+        flush=True,
+    )
+    print(
+        f"frozen_vjepa_params={sum(p.numel() for p in vjepa_encoder.parameters())}",
+        flush=True,
+    )
+
+    pending_batch = first_batch
+    last_loss_dict: dict[str, float] = {}
+    start_time = time.time()
+    for step in range(1, int(args.steps) + 1):
+        batch = pending_batch if pending_batch is not None else batcher.next_batch()
+        pending_batch = None
+        batch = move_batch(batch, device=device, dtype=param_dtype)
+
+        optimizer.zero_grad(set_to_none=True)
+        autocast_context = (
+            torch.autocast(device_type=device.type, dtype=autocast_dtype)
+            if autocast_dtype is not None and device.type == "cuda"
+            else nullcontext()
+        )
+        with autocast_context:
+            current_tokens, target_future_tokens = encode_videos(
+                vjepa_encoder,
+                batch["video"],
+                current_frames=int(args.current_frame_count),
+                future_frames=int(args.future_frame_count),
+            )
+            condition_context, condition_mask = build_condition(
+                context=batch["context"],
+                context_mask=batch["context_mask"],
+                proprio=batch.get("proprio"),
+                proprio_encoder=proprio_encoder,
+            )
+            out = predictor(
+                current_jepa_tokens=current_tokens,
+                condition_context=condition_context,
+                condition_mask=condition_mask,
+            )
+            pred_future_tokens = out["pred_future_tokens"]
+            if pred_future_tokens.shape != target_future_tokens.shape:
+                raise ValueError(
+                    "pred_future_tokens shape must match target future tokens, "
+                    f"got {tuple(pred_future_tokens.shape)} vs {tuple(target_future_tokens.shape)}."
+                )
+            loss_future_l1 = F.l1_loss(
+                pred_future_tokens.float(), target_future_tokens.float()
+            )
+            loss_future_cos = future_cosine_loss(
+                pred_future_tokens, target_future_tokens
+            )
+            loss_total = loss_future_l1 + float(args.lambda_cos) * loss_future_cos
+
+        if not torch.isfinite(loss_total):
+            raise RuntimeError(f"loss_total is not finite at step {step}.")
+        loss_total.backward()
+        if float(args.max_grad_norm) > 0.0:
+            torch.nn.utils.clip_grad_norm_(trainable_params, float(args.max_grad_norm))
+        optimizer.step()
+
+        last_loss_dict = {
+            "loss_total": float(loss_total.detach().item()),
+            "loss_future_l1": float(loss_future_l1.detach().item()),
+            "loss_future_cos": float(loss_future_cos.detach().item()),
+        }
+        if step == 1 or step % int(args.log_every) == 0:
+            elapsed = max(time.time() - start_time, 1.0e-6)
+            samples_per_sec = float(step * int(args.batch_size) / elapsed)
+            print(
+                " ".join(
+                    [
+                        f"step={step}",
+                        f"batch_source_counts={source_counts_to_str(batch['source_counts'])}",
+                        f"loss_future_l1={last_loss_dict['loss_future_l1']:.6f}",
+                        f"loss_future_cos={last_loss_dict['loss_future_cos']:.6f}",
+                        f"loss_total={last_loss_dict['loss_total']:.6f}",
+                        f"lr={optimizer.param_groups[0]['lr']:.6e}",
+                        f"samples_per_sec={samples_per_sec:.3f}",
+                    ]
+                ),
+                flush=True,
+            )
+        if int(args.save_every) > 0 and step % int(args.save_every) == 0:
+            path = save_checkpoint(
+                output_dir=output_dir,
+                predictor=predictor,
+                adapter=adapter,
+                proprio_encoder=proprio_encoder,
+                optimizer=optimizer,
+                step=step,
+                args=args,
+                load_stats=load_stats,
+                loss_dict=last_loss_dict,
+            )
+            print(f"saved_checkpoint_path={path}", flush=True)
+
+    final_path = save_checkpoint(
+        output_dir=output_dir,
+        predictor=predictor,
+        adapter=adapter,
+        proprio_encoder=proprio_encoder,
+        optimizer=optimizer,
+        step=int(args.steps),
+        args=args,
+        load_stats=load_stats,
+        loss_dict=last_loss_dict,
+    )
+    print(f"saved_checkpoint_path={final_path}", flush=True)
+    summary_path = output_dir / "stage1_summary.json"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "args": vars(args),
+                "dataset_sampling_ratio": mix,
+                "vjepa2ac_load_stats": load_stats,
+                "last_loss_dict": last_loss_dict,
+                "final_checkpoint": str(final_path),
+            },
+            f,
+            indent=2,
+        )
+    print(f"saved_summary_path={summary_path}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

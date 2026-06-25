@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import random
+import re
 import sys
 import time
 from collections import Counter
@@ -125,9 +126,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vjepa-input-range", default="-1_1", choices=["-1_1", "0_1"])
     parser.add_argument("--vjepa-tubelet-size", type=int, default=2)
     parser.add_argument("--vjepa-dim", type=int, default=1408)
-    parser.add_argument("--hidden-dim", type=int, default=1408)
+    parser.add_argument("--future-predictor-hidden-dim", type=int, default=1408)
     parser.add_argument("--num-future-tokens", type=int, default=256)
-    parser.add_argument("--future-predictor-layers", type=int, default=6)
+    parser.add_argument("--future-predictor-layers", type=int, default=12)
     parser.add_argument("--future-predictor-heads", type=int, default=8)
     parser.add_argument("--adapter-current-tokens", type=int, default=16)
     parser.add_argument("--adapter-future-tokens", type=int, default=16)
@@ -477,7 +478,7 @@ def build_modules(
 
     predictor = JepaFuturePredictor(
         vjepa_dim=int(args.vjepa_dim),
-        hidden_dim=int(args.hidden_dim),
+        hidden_dim=int(args.future_predictor_hidden_dim),
         num_future_tokens=int(args.num_future_tokens),
         text_dim=int(text_dim),
         num_layers=int(args.future_predictor_layers),
@@ -548,6 +549,38 @@ def future_cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor
 def source_counts_to_str(counts: dict[str, int]) -> str:
     return ",".join(f"{name}:{counts[name]}" for name in sorted(counts))
 
+def _extract_predictor_block_index(key: str) -> int | None:
+    match = re.search(r"(?:^|\.)predictor_blocks\.(\d+)\.", str(key))
+    return None if match is None else int(match.group(1))
+
+
+def predictor_block_load_summary(load_stats: dict[str, Any]) -> dict[str, Any]:
+    loaded_keys = [str(key) for key in load_stats.get("loaded_keys", [])]
+    skipped_keys = [str(key) for key in load_stats.get("skipped_keys", [])]
+    mismatch_keys = [str(item.get("source_key")) for item in load_stats.get("shape_mismatch_keys", [])]
+    detected_blocks = sorted(
+        {
+            idx
+            for key in [*loaded_keys, *skipped_keys, *mismatch_keys]
+            for idx in [_extract_predictor_block_index(key)]
+            if idx is not None
+        }
+    )
+    loaded_blocks = sorted(
+        {
+            idx
+            for key in loaded_keys
+            for idx in [_extract_predictor_block_index(key)]
+            if idx is not None
+        }
+    )
+    return {
+        "checkpoint_predictor_blocks_detected": len(detected_blocks),
+        "checkpoint_predictor_block_ids_detected": detected_blocks,
+        "loaded_predictor_blocks": loaded_blocks,
+        "loaded_predictor_blocks_count": len(loaded_blocks),
+    }
+
 
 def save_checkpoint(
     *,
@@ -570,6 +603,7 @@ def save_checkpoint(
         "step": int(step),
         "config": vars(args),
         "vjepa2ac_load_stats": load_stats,
+        "vjepa2ac_block_summary": predictor_block_load_summary(load_stats or {}),
         "loss_dict": dict(loss_dict),
     }
     if proprio_encoder is not None:
@@ -673,9 +707,14 @@ def main() -> None:
         trainable_params, lr=float(args.lr), weight_decay=float(args.weight_decay)
     )
 
+    block_summary = predictor_block_load_summary(load_stats)
     print(
         "vjepa2ac_init_stats "
+        f"model_num_layers={args.future_predictor_layers} "
+        f"checkpoint_predictor_blocks_detected={block_summary['checkpoint_predictor_blocks_detected']} "
+        f"loaded_predictor_blocks={block_summary['loaded_predictor_blocks']} "
         f"loaded_keys_count={load_stats.get('loaded_keys_count')} "
+        f"loaded_params_count={load_stats.get('loaded_params_count', 0)} "
         f"skipped_keys_count={load_stats.get('skipped_keys_count')} "
         f"shape_mismatch_count={load_stats.get('shape_mismatch_count')} "
         f"init_source={load_stats.get('init_source')}",
@@ -807,6 +846,7 @@ def main() -> None:
                 "args": vars(args),
                 "dataset_sampling_ratio": mix,
                 "vjepa2ac_load_stats": load_stats,
+                "vjepa2ac_block_summary": predictor_block_load_summary(load_stats),
                 "last_loss_dict": last_loss_dict,
                 "final_checkpoint": str(final_path),
             },

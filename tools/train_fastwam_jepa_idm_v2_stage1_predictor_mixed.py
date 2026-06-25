@@ -408,9 +408,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vjepa-tubelet-size", type=int, default=2)
     parser.add_argument("--vjepa-dim", type=int, default=1408)
     parser.add_argument("--future-predictor-hidden-dim", type=int, default=1408)
-    parser.add_argument("--num-future-tokens", type=int, default=256)
-    parser.add_argument("--future-predictor-layers", type=int, default=12)
-    parser.add_argument("--future-predictor-heads", type=int, default=8)
+    parser.add_argument("--num-future-tokens", default="auto")
+    parser.add_argument("--future-predictor-layers", type=int, default=24)
+    parser.add_argument("--future-predictor-heads", type=int, default=16)
     parser.add_argument("--adapter-current-tokens", type=int, default=16)
     parser.add_argument("--adapter-future-tokens", type=int, default=16)
     parser.add_argument("--current-frame-count", type=int, default=4)
@@ -907,7 +907,7 @@ def move_batch(
     batch: dict[str, Any], *, device: torch.device, dtype: torch.dtype
 ) -> dict[str, Any]:
     moved = dict(batch)
-    for key in ("video", "context"):
+    for key in ("video", "future_video", "context"):
         value = moved.get(key)
         if torch.is_tensor(value):
             moved[key] = value.to(device=device, dtype=dtype, non_blocking=True)
@@ -946,9 +946,124 @@ def build_condition(
     )
 
 
+
+def _parse_auto_int(value: Any, *, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip().lower()
+        if stripped in {"", "auto", "unset", "none", "0"}:
+            return None
+        try:
+            parsed = int(stripped)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a positive integer or 'auto', got {value!r}.") from exc
+    else:
+        parsed = int(value)
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _provisional_num_tokens_for_encoder(args: argparse.Namespace) -> int:
+    requested = _parse_auto_int(args.num_future_tokens, name="--num-future-tokens")
+    return int(requested) if requested is not None else 256
+
+
+def infer_and_resolve_vjepa_token_counts(
+    *,
+    vjepa_encoder: torch.nn.Module,
+    first_batch: dict[str, Any],
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[int, int, int]:
+    probe_batch = move_batch(first_batch, device=device, dtype=dtype)
+    current_tokens, target_future_tokens = encode_videos(
+        vjepa_encoder,
+        probe_batch["video"],
+        probe_batch["future_video"],
+        current_frames=int(args.current_frame_count),
+        future_frames=int(args.future_frame_count),
+    )
+    current_token_count = int(current_tokens.shape[1])
+    future_token_count = int(target_future_tokens.shape[1])
+    if current_token_count != future_token_count:
+        raise ValueError(
+            "RoPE full-transformer JepaFuturePredictor requires current/future token counts to match, "
+            f"got current_token_count={current_token_count}, future_token_count={future_token_count}."
+        )
+
+    requested = _parse_auto_int(args.num_future_tokens, name="--num-future-tokens")
+    if requested is None:
+        resolved = future_token_count
+    elif int(requested) != future_token_count:
+        raise ValueError(
+            "--num-future-tokens does not match V-JEPA output for the configured frame counts: "
+            f"requested={requested}, future_token_count={future_token_count}, "
+            f"current_frame_count={args.current_frame_count}, future_frame_count={args.future_frame_count}. "
+            "Use --num-future-tokens auto or set it to the inferred token count."
+        )
+    else:
+        resolved = int(requested)
+
+    args.num_future_tokens = int(resolved)
+    args.resolved_num_future_tokens = int(resolved)
+    print(f"current_frame_count={args.current_frame_count}", flush=True)
+    print(f"future_frame_count={args.future_frame_count}", flush=True)
+    print(f"current_token_count={current_token_count}", flush=True)
+    print(f"future_token_count={future_token_count}", flush=True)
+    print(f"resolved_num_future_tokens={resolved}", flush=True)
+    return current_token_count, future_token_count, int(resolved)
+
+
+def validate_vjepa2ac_predictor_load(
+    *, load_stats: dict[str, Any], args: argparse.Namespace
+) -> None:
+    if args.vjepa2ac_checkpoint is None:
+        return
+    block_summary = predictor_block_load_summary(load_stats)
+    loaded_blocks = set(int(idx) for idx in block_summary.get("loaded_predictor_blocks", []))
+    requested_blocks = set(range(int(args.future_predictor_layers)))
+    if not loaded_blocks:
+        raise RuntimeError(
+            "V-JEPA2-AC predictor checkpoint was provided, but no predictor blocks were loaded. "
+            f"load_stats={load_stats}"
+        )
+    missing_blocks = sorted(requested_blocks - loaded_blocks)
+    if missing_blocks:
+        raise RuntimeError(
+            "V-JEPA2-AC predictor checkpoint did not initialize all requested predictor layers. "
+            f"missing_blocks={missing_blocks}, loaded_blocks={sorted(loaded_blocks)}."
+        )
+    loaded_keys_count = int(load_stats.get("loaded_keys_count", 0) or 0)
+    if int(args.future_predictor_layers) >= 24 and loaded_keys_count < 250:
+        raise RuntimeError(
+            "V-JEPA2-AC 24-layer initialization loaded too few keys; expected around 294. "
+            f"loaded_keys_count={loaded_keys_count}, load_stats={load_stats}"
+        )
+    shape_mismatches = list(load_stats.get("shape_mismatch_keys", []) or [])
+    block_mismatches = [
+        item
+        for item in shape_mismatches
+        if "predictor_blocks." in str(item.get("source_key", item))
+    ]
+    if block_mismatches:
+        raise RuntimeError(
+            "V-JEPA2-AC predictor block shape mismatches are not acceptable. "
+            f"block_mismatches={block_mismatches}"
+        )
+    if shape_mismatches:
+        print(
+            "WARNING vjepa2ac_non_block_shape_mismatches="
+            f"{shape_mismatches}",
+            flush=True,
+        )
+
 def build_modules(
     *,
     args: argparse.Namespace,
+    first_batch: dict[str, Any],
     text_dim: int,
     proprio_dim: int | None,
     device: torch.device,
@@ -967,7 +1082,7 @@ def build_modules(
         ),
         pretrained=False,
         vjepa_dim=int(args.vjepa_dim),
-        num_tokens=int(args.num_future_tokens),
+        num_tokens=_provisional_num_tokens_for_encoder(args),
         freeze=True,
         normalize_tokens=False,
         img_size=int(args.vjepa_img_size),
@@ -978,10 +1093,18 @@ def build_modules(
     vjepa_encoder.eval()
     vjepa_encoder.requires_grad_(False)
 
+    infer_and_resolve_vjepa_token_counts(
+        vjepa_encoder=vjepa_encoder,
+        first_batch=first_batch,
+        args=args,
+        device=device,
+        dtype=dtype,
+    )
+
     predictor = JepaFuturePredictor(
         vjepa_dim=int(args.vjepa_dim),
         hidden_dim=int(args.future_predictor_hidden_dim),
-        num_future_tokens=int(args.num_future_tokens),
+        num_future_tokens=int(args.resolved_num_future_tokens),
         text_dim=int(text_dim),
         num_layers=int(args.future_predictor_layers),
         num_heads=int(args.future_predictor_heads),
@@ -1008,10 +1131,7 @@ def build_modules(
     if args.vjepa2ac_checkpoint is not None:
         ckpt_path = require_file(args.vjepa2ac_checkpoint, name="--vjepa2ac-checkpoint")
         load_stats = predictor.load_vjepa2ac_predictor_weights(ckpt_path)
-        if int(load_stats.get("loaded_keys_count", 0)) <= 0:
-            raise RuntimeError(
-                f"V-JEPA2-AC predictor init loaded no compatible keys: {load_stats}"
-            )
+        validate_vjepa2ac_predictor_load(load_stats=load_stats, args=args)
     else:
         load_stats = {
             "init_source": "random_init_no_vjepa2ac_checkpoint",
@@ -1022,7 +1142,6 @@ def build_modules(
         print("V-JEPA2-AC predictor init skipped: random init", flush=True)
 
     return vjepa_encoder, predictor, adapter, proprio_encoder, load_stats
-
 
 def encode_videos(
     vjepa_encoder: torch.nn.Module,
@@ -1108,6 +1227,7 @@ def save_checkpoint(
     explicit_stage1_config = {
         "current_frame_count": int(args.current_frame_count),
         "future_frame_count": int(args.future_frame_count),
+        "resolved_num_future_tokens": int(args.resolved_num_future_tokens),
         "video_size": int(args.video_size),
         "vjepa_img_size": int(args.vjepa_img_size),
         "future_predictor_layers": int(args.future_predictor_layers),
@@ -1227,6 +1347,7 @@ def main() -> None:
 
     vjepa_encoder, predictor, adapter, proprio_encoder, load_stats = build_modules(
         args=args,
+        first_batch=first_batch,
         text_dim=text_dim,
         proprio_dim=proprio_dim,
         device=device,
@@ -1471,6 +1592,7 @@ def main() -> None:
                     "stage1_temporal_config": {
                         "current_frame_count": int(args.current_frame_count),
                         "future_frame_count": int(args.future_frame_count),
+                        "resolved_num_future_tokens": int(args.resolved_num_future_tokens),
                         "video_size": int(args.video_size),
                         "vjepa_img_size": int(args.vjepa_img_size),
                         "future_predictor_layers": int(args.future_predictor_layers),

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import sys
@@ -14,10 +16,12 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -422,6 +426,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use-proprio", action="store_true", default=False)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--ddp-find-unused-parameters", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--log-rank0-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--disable-wsl-fallback", action=argparse.BooleanOptionalAction, default=True
     )
@@ -584,7 +591,7 @@ def build_source_dataset(*, source: str, args: argparse.Namespace):
             text_embedding_cache_dir=cfg.data.train.get("text_embedding_cache_dir"),
             max_episodes=args.max_robotwin_episodes,
             validate_files=str(args.robotwin_validate_files),
-            seed=int(args.seed),
+            seed=int(getattr(args, "_rank_seed", args.seed)),
         )
     else:
         dataset = instantiate(cfg.data.train)
@@ -735,6 +742,54 @@ def precision_to_dtype(
             torch.float16 if device.type == "cuda" else None,
         )
     raise ValueError(f"Unsupported precision: {precision}")
+
+def init_distributed_from_env() -> tuple[bool, int, int, int, torch.device]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1:
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP mode requires CUDA because this script uses NCCL.")
+        torch.cuda.set_device(local_rank)
+        if not dist.is_available():
+            raise RuntimeError("torch.distributed is not available in this PyTorch build.")
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        return True, world_size, rank, local_rank, torch.device(f"cuda:{local_rank}")
+    return False, world_size, rank, local_rank, resolve_device()
+
+
+def configure_rank_printing(*, rank: int, log_rank0_only: bool) -> None:
+    if log_rank0_only and rank != 0:
+        builtins.print = lambda *args, **kwargs: None
+
+
+def is_rank0(rank: int) -> bool:
+    return int(rank) == 0
+
+
+def unwrap_ddp(module: torch.nn.Module | None) -> torch.nn.Module | None:
+    if module is None:
+        return None
+    return module.module if isinstance(module, DDP) else module
+
+
+def reduce_mean_tensor(value: torch.Tensor, *, ddp_enabled: bool, world_size: int) -> torch.Tensor:
+    reduced = value.detach().float()
+    if ddp_enabled:
+        reduced = reduced.clone()
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+        reduced = reduced / float(world_size)
+    return reduced
+
+
+def reduce_source_counts(
+    counts: dict[str, int], *, source_names: list[str], device: torch.device, ddp_enabled: bool
+) -> dict[str, int]:
+    values = torch.tensor([int(counts.get(name, 0)) for name in source_names], device=device, dtype=torch.long)
+    if ddp_enabled:
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    return {name: int(values[idx].item()) for idx, name in enumerate(source_names)}
 
 
 def move_batch(
@@ -933,8 +988,8 @@ def save_checkpoint(
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"checkpoint_step_{int(step):06d}.pt"
     payload = {
-        "future_predictor": predictor.state_dict(),
-        "jepa_adapter": adapter.state_dict(),
+        "future_predictor": unwrap_ddp(predictor).state_dict(),
+        "jepa_adapter": unwrap_ddp(adapter).state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": int(step),
         "config": vars(args),
@@ -943,13 +998,20 @@ def save_checkpoint(
         "loss_dict": dict(loss_dict),
     }
     if proprio_encoder is not None:
-        payload["proprio_encoder"] = proprio_encoder.state_dict()
+        payload["proprio_encoder"] = unwrap_ddp(proprio_encoder).state_dict()
     torch.save(payload, path)
     return path
 
 
 def main() -> None:
     args = parse_args()
+    ddp_enabled, world_size, rank, local_rank, device = init_distributed_from_env()
+    configure_rank_printing(rank=rank, log_rank0_only=bool(args.log_rank0_only))
+    args._rank = rank
+    args._world_size = world_size
+    args._local_rank = local_rank
+    args._rank_seed = int(args.seed) + rank * 100003
+
     runtime_status = configure_runtime_stability(
         disable_wsl_fallback=args.disable_wsl_fallback,
         log_level=args.runtime_log_level,
@@ -967,14 +1029,22 @@ def main() -> None:
         raise ValueError(f"--steps must be positive, got {args.steps}.")
     if int(args.batch_size) <= 0:
         raise ValueError(f"--batch-size must be positive, got {args.batch_size}.")
+    if int(args.grad_accum_steps) <= 0:
+        raise ValueError(f"--grad-accum-steps must be positive, got {args.grad_accum_steps}.")
     if float(args.lambda_cos) < 0.0:
         raise ValueError(f"--lambda-cos must be non-negative, got {args.lambda_cos}.")
 
-    torch.manual_seed(int(args.seed))
+    torch.manual_seed(int(args._rank_seed))
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(args.seed))
-    device = resolve_device()
+        torch.cuda.manual_seed_all(int(args._rank_seed))
     param_dtype, autocast_dtype = precision_to_dtype(str(args.precision), device)
+    print(f"ddp_enabled={ddp_enabled}", flush=True)
+    print(f"world_size={world_size}", flush=True)
+    print(f"rank={rank}", flush=True)
+    print(f"local_rank={local_rank}", flush=True)
+    print(f"per_gpu_batch_size={args.batch_size}", flush=True)
+    print(f"grad_accum_steps={args.grad_accum_steps}", flush=True)
+    print(f"effective_global_batch_size={int(args.batch_size) * int(world_size) * int(args.grad_accum_steps)}", flush=True)
     output_dir = resolve_path(args.output_dir)
     if output_dir is None:
         raise ValueError("--output-dir is required.")
@@ -995,7 +1065,7 @@ def main() -> None:
             name=source,
             dataset=dataset,
             num_workers=int(args.num_workers),
-            seed=int(args.seed) + idx * 1009,
+            seed=int(getattr(args, "_rank_seed", args.seed)) + idx * 1009,
         )
         for idx, (source, dataset) in enumerate(datasets.items())
     }
@@ -1004,7 +1074,7 @@ def main() -> None:
         weights=mix,
         batch_size=int(args.batch_size),
         video_size=int(args.video_size),
-        seed=int(args.seed),
+        seed=int(getattr(args, "_rank_seed", args.seed)),
         use_proprio=bool(args.use_proprio),
     )
 
@@ -1032,6 +1102,24 @@ def main() -> None:
     predictor.train()
     adapter.eval()
     adapter.requires_grad_(False)
+    if proprio_encoder is not None:
+        proprio_encoder.train()
+
+    if ddp_enabled:
+        predictor = DDP(
+            predictor,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=bool(args.ddp_find_unused_parameters),
+        )
+        if proprio_encoder is not None:
+            proprio_encoder = DDP(
+                proprio_encoder,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=bool(args.ddp_find_unused_parameters),
+            )
+
     train_modules: list[torch.nn.Module] = [predictor]
     if proprio_encoder is not None:
         train_modules.append(proprio_encoder)
@@ -1081,14 +1169,24 @@ def main() -> None:
     pending_batch = first_batch
     last_loss_dict: dict[str, float] = {}
     start_time = time.time()
-    for step in range(1, int(args.steps) + 1):
+    optimizer.zero_grad(set_to_none=True)
+
+    update_step = 0
+    micro_step = 0
+    grad_accum_steps = int(args.grad_accum_steps)
+    source_names = sorted(mix.keys())
+    accum_loss_future_l1 = torch.zeros((), device=device, dtype=torch.float32)
+    accum_loss_future_cos = torch.zeros((), device=device, dtype=torch.float32)
+    accum_loss_total = torch.zeros((), device=device, dtype=torch.float32)
+    accum_source_counts: Counter[str] = Counter()
+
+    while update_step < int(args.steps):
         batch = pending_batch if pending_batch is not None else batcher.next_batch()
         pending_batch = None
         batch = move_batch(batch, device=device, dtype=param_dtype)
 
-        optimizer.zero_grad(set_to_none=True)
         autocast_context = (
-            torch.autocast(device_type=device.type, dtype=autocast_dtype)
+            torch.autocast(device_type="cuda", dtype=autocast_dtype)
             if autocast_dtype is not None and device.type == "cuda"
             else nullcontext()
         )
@@ -1111,91 +1209,149 @@ def main() -> None:
                 condition_mask=condition_mask,
             )
             pred_future_tokens = out["pred_future_tokens"]
-            if pred_future_tokens.shape != target_future_tokens.shape:
+            if tuple(pred_future_tokens.shape) != tuple(target_future_tokens.shape):
                 raise ValueError(
-                    "pred_future_tokens shape must match target future tokens, "
-                    f"got {tuple(pred_future_tokens.shape)} vs {tuple(target_future_tokens.shape)}."
+                    "Predicted future token shape mismatch, "
+                    f"got {tuple(pred_future_tokens.shape)} vs target {tuple(target_future_tokens.shape)}."
                 )
-            loss_future_l1 = F.l1_loss(
-                pred_future_tokens.float(), target_future_tokens.float()
-            )
-            loss_future_cos = future_cosine_loss(
-                pred_future_tokens, target_future_tokens
-            )
+            loss_future_l1 = F.l1_loss(pred_future_tokens, target_future_tokens)
+            loss_future_cos = future_cosine_loss(pred_future_tokens, target_future_tokens)
             loss_total = loss_future_l1 + float(args.lambda_cos) * loss_future_cos
+            scaled_loss = loss_total / float(grad_accum_steps)
 
-        if not torch.isfinite(loss_total):
-            raise RuntimeError(f"loss_total is not finite at step {step}.")
-        loss_total.backward()
-        if float(args.max_grad_norm) > 0.0:
+        finite_flag = torch.tensor(
+            1 if torch.isfinite(loss_total).item() else 0,
+            device=device,
+            dtype=torch.int32,
+        )
+        if ddp_enabled:
+            dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+        if int(finite_flag.item()) != 1:
+            raise RuntimeError(
+                f"Non-finite loss detected at micro_step={micro_step + 1}, "
+                f"next_update_step={update_step + 1}."
+            )
+
+        scaled_loss.backward()
+        micro_step += 1
+        accum_loss_future_l1 += loss_future_l1.detach().float()
+        accum_loss_future_cos += loss_future_cos.detach().float()
+        accum_loss_total += loss_total.detach().float()
+        accum_source_counts.update(batch["source_counts"])
+
+        if micro_step % grad_accum_steps != 0:
+            continue
+
+        if float(args.max_grad_norm) > 0:
             torch.nn.utils.clip_grad_norm_(trainable_params, float(args.max_grad_norm))
         optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        update_step += 1
+
+        local_loss_future_l1 = accum_loss_future_l1 / float(grad_accum_steps)
+        local_loss_future_cos = accum_loss_future_cos / float(grad_accum_steps)
+        local_loss_total = accum_loss_total / float(grad_accum_steps)
+        reduced_loss_future_l1 = reduce_mean_tensor(
+            local_loss_future_l1,
+            ddp_enabled=ddp_enabled,
+            world_size=world_size,
+        )
+        reduced_loss_future_cos = reduce_mean_tensor(
+            local_loss_future_cos,
+            ddp_enabled=ddp_enabled,
+            world_size=world_size,
+        )
+        reduced_loss_total = reduce_mean_tensor(
+            local_loss_total,
+            ddp_enabled=ddp_enabled,
+            world_size=world_size,
+        )
+        global_source_counts = reduce_source_counts(
+            dict(accum_source_counts),
+            source_names=source_names,
+            device=device,
+            ddp_enabled=ddp_enabled,
+        )
 
         last_loss_dict = {
-            "loss_total": float(loss_total.detach().item()),
-            "loss_future_l1": float(loss_future_l1.detach().item()),
-            "loss_future_cos": float(loss_future_cos.detach().item()),
+            "loss_total": float(reduced_loss_total.item()),
+            "loss_future_l1": float(reduced_loss_future_l1.item()),
+            "loss_future_cos": float(reduced_loss_future_cos.item()),
         }
-        if step == 1 or step % int(args.log_every) == 0:
-            elapsed = max(time.time() - start_time, 1.0e-6)
-            samples_per_sec = float(step * int(args.batch_size) / elapsed)
+        if update_step == 1 or update_step % int(args.log_every) == 0:
+            elapsed = max(time.time() - start_time, 1e-6)
+            samples = update_step * int(args.batch_size) * world_size * grad_accum_steps
             print(
-                " ".join(
-                    [
-                        f"step={step}",
-                        f"batch_source_counts={source_counts_to_str(batch['source_counts'])}",
-                        f"loss_future_l1={last_loss_dict['loss_future_l1']:.6f}",
-                        f"loss_future_cos={last_loss_dict['loss_future_cos']:.6f}",
-                        f"loss_total={last_loss_dict['loss_total']:.6f}",
-                        f"lr={optimizer.param_groups[0]['lr']:.6e}",
-                        f"samples_per_sec={samples_per_sec:.3f}",
-                    ]
-                ),
+                "step="
+                f"{update_step} loss_total={last_loss_dict['loss_total']:.6f} "
+                f"loss_future_l1={last_loss_dict['loss_future_l1']:.6f} "
+                f"loss_future_cos={last_loss_dict['loss_future_cos']:.6f} "
+                f"lr={optimizer.param_groups[0]['lr']:.6e} "
+                f"batch_source_counts={global_source_counts} "
+                f"samples_per_sec={samples / elapsed:.2f}",
                 flush=True,
             )
-        if int(args.save_every) > 0 and step % int(args.save_every) == 0:
+
+        if is_rank0(rank) and int(args.save_every) > 0 and update_step % int(args.save_every) == 0:
             path = save_checkpoint(
                 output_dir=output_dir,
+                step=update_step,
                 predictor=predictor,
                 adapter=adapter,
                 proprio_encoder=proprio_encoder,
                 optimizer=optimizer,
-                step=step,
                 args=args,
-                load_stats=load_stats,
                 loss_dict=last_loss_dict,
+                load_stats=load_stats,
             )
-            print(f"saved_checkpoint_path={path}", flush=True)
+            print(f"saved_checkpoint path={path}", flush=True)
 
-    final_path = save_checkpoint(
-        output_dir=output_dir,
-        predictor=predictor,
-        adapter=adapter,
-        proprio_encoder=proprio_encoder,
-        optimizer=optimizer,
-        step=int(args.steps),
-        args=args,
-        load_stats=load_stats,
-        loss_dict=last_loss_dict,
-    )
-    print(f"saved_checkpoint_path={final_path}", flush=True)
-    summary_path = output_dir / "stage1_summary.json"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with summary_path.open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "args": vars(args),
-                "dataset_sampling_ratio": mix,
-                "vjepa2ac_load_stats": load_stats,
-                "vjepa2ac_block_summary": predictor_block_load_summary(load_stats),
-                "last_loss_dict": last_loss_dict,
-                "final_checkpoint": str(final_path),
-            },
-            f,
-            indent=2,
+        accum_loss_future_l1.zero_()
+        accum_loss_future_cos.zero_()
+        accum_loss_total.zero_()
+        accum_source_counts.clear()
+
+    if is_rank0(rank):
+        final_path = save_checkpoint(
+            output_dir=output_dir,
+            step=int(args.steps),
+            predictor=predictor,
+            adapter=adapter,
+            proprio_encoder=proprio_encoder,
+            optimizer=optimizer,
+            args=args,
+            loss_dict=last_loss_dict,
+            load_stats=load_stats,
         )
-    print(f"saved_summary_path={summary_path}", flush=True)
+        print(f"saved_final_checkpoint path={final_path}", flush=True)
 
+        summary_path = output_dir / "stage1_summary.json"
+        with summary_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "final_checkpoint": str(final_path),
+                    "last_loss": last_loss_dict,
+                    "dataset_sampling_ratio": mix,
+                    "vjepa2ac_load_stats": load_stats,
+                    "vjepa2ac_block_summary": predictor_block_load_summary(load_stats),
+                    "args": vars(args),
+                    "ddp": {
+                        "enabled": ddp_enabled,
+                        "world_size": world_size,
+                        "rank": rank,
+                        "local_rank": local_rank,
+                        "grad_accum_steps": grad_accum_steps,
+                        "effective_global_batch_size": int(args.batch_size) * world_size * grad_accum_steps,
+                    },
+                },
+                f,
+                indent=2,
+            )
+        print(f"saved_summary path={summary_path}", flush=True)
+
+    if ddp_enabled:
+        dist.barrier()
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

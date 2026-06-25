@@ -98,8 +98,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--output-dir", default="evaluate_results/fastwam_jepa_idm_v2_predictor_value")
-    parser.add_argument("--current-frame-count", type=int, default=2)
-    parser.add_argument("--future-frame-count", type=int, default=2)
+    parser.add_argument("--current-frame-count", type=int, default=4)
+    parser.add_argument("--future-frame-count", type=int, default=4)
     parser.add_argument("--num-future-tokens", type=int, default=256)
     parser.add_argument("--vjepa-dim", type=int, default=1408)
     parser.add_argument("--adapter-current-tokens", type=int, default=16)
@@ -333,12 +333,58 @@ def build_action_expert(
     return action_expert.to(device=device, dtype=dtype)
 
 
-def load_predictor_checkpoint(model: torch.nn.Module, checkpoint_path: Path, *, device: torch.device) -> str:
+def _checkpoint_temporal_config(payload: dict[str, Any]) -> dict[str, Any]:
+    config = payload.get("stage1_temporal_config")
+    if not isinstance(config, dict):
+        config = payload.get("config")
+    if not isinstance(config, dict):
+        config = payload.get("args")
+    if not isinstance(config, dict):
+        return {}
+    keys = (
+        "current_frame_count",
+        "future_frame_count",
+        "video_size",
+        "vjepa_img_size",
+        "future_predictor_layers",
+        "future_predictor_hidden_dim",
+        "future_predictor_heads",
+    )
+    return {key: config.get(key) for key in keys if key in config}
+
+
+def _warn_if_checkpoint_temporal_differs(
+    *, checkpoint_config: dict[str, Any], args: argparse.Namespace
+) -> None:
+    print(f"checkpoint_stage1_temporal_config={checkpoint_config}", flush=True)
+    comparisons = {
+        "current_frame_count": args.current_frame_count,
+        "future_frame_count": args.future_frame_count,
+        "vjepa_img_size": args.vjepa_img_size,
+        "future_predictor_layers": args.future_predictor_layers,
+        "future_predictor_heads": args.future_predictor_heads,
+    }
+    for key, cli_value in comparisons.items():
+        ckpt_value = checkpoint_config.get(key)
+        if ckpt_value is None:
+            continue
+        if str(ckpt_value) != str(cli_value):
+            print(
+                f"WARNING checkpoint {key}={ckpt_value} differs from CLI {key}={cli_value}",
+                flush=True,
+            )
+
+
+def load_predictor_checkpoint(
+    model: torch.nn.Module, checkpoint_path: Path, *, device: torch.device, args: argparse.Namespace
+) -> str:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Predictor checkpoint does not exist: {checkpoint_path}")
     payload = torch.load(checkpoint_path, map_location=device)
     if not isinstance(payload, dict):
         raise ValueError(f"Predictor checkpoint must be a dict, got {type(payload)}.")
+    checkpoint_config = _checkpoint_temporal_config(payload)
+    _warn_if_checkpoint_temporal_differs(checkpoint_config=checkpoint_config, args=args)
     state = extract_predictor_state_dict(payload)
     missing, unexpected = model.future_predictor.load_state_dict(state, strict=True)
     if missing or unexpected:
@@ -422,6 +468,7 @@ def build_model(
         model,
         resolve_path(args.predictor_checkpoint),
         device=device,
+        args=args,
     )
     model.future_predictor.eval()
     model.future_predictor.requires_grad_(False)

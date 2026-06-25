@@ -88,6 +88,8 @@ class MixedDemoBatcher:
         video_size: int,
         seed: int,
         use_proprio: bool,
+        current_frame_count: int,
+        future_frame_count: int,
     ) -> None:
         self.sources = sources
         self.weights = normalize_mix(weights)
@@ -95,6 +97,8 @@ class MixedDemoBatcher:
         self.video_size = int(video_size)
         self.rng = random.Random(int(seed))
         self.use_proprio = bool(use_proprio)
+        self.current_frame_count = int(current_frame_count)
+        self.future_frame_count = int(future_frame_count)
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}.")
 
@@ -106,7 +110,11 @@ class MixedDemoBatcher:
             for _ in range(self.batch_size)
         ]
         return collate_stage1_samples(
-            samples, video_size=self.video_size, use_proprio=self.use_proprio
+            samples,
+            video_size=self.video_size,
+            use_proprio=self.use_proprio,
+            current_frame_count=self.current_frame_count,
+            future_frame_count=self.future_frame_count,
         )
 
 class RoboTwin2Stage1Dataset(torch.utils.data.Dataset):
@@ -353,10 +361,12 @@ class RoboTwin2Stage1Dataset(torch.utils.data.Dataset):
             parquet_tensors,
             ("observation.state", "proprio", "state", "observation.proprio"),
         )
+        current_video = video[:, : self.current_frame_count]
+        future_video = video[:, self.current_frame_count : self.total_frames]
         return {
-            "video": video,
-            "current_video": video[:, : self.current_frame_count],
-            "future_video": video[:, self.current_frame_count : self.total_frames],
+            "video": current_video,
+            "current_video": current_video,
+            "future_video": future_video,
             "context": context,
             "context_mask": context_mask,
             "proprio": proprio,
@@ -403,8 +413,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--future-predictor-heads", type=int, default=8)
     parser.add_argument("--adapter-current-tokens", type=int, default=16)
     parser.add_argument("--adapter-future-tokens", type=int, default=16)
-    parser.add_argument("--current-frame-count", type=int, default=2)
-    parser.add_argument("--future-frame-count", type=int, default=2)
+    parser.add_argument("--current-frame-count", type=int, default=4)
+    parser.add_argument("--future-frame-count", type=int, default=4)
     parser.add_argument(
         "--video-size",
         type=int,
@@ -658,9 +668,82 @@ def maybe_stack_tensors(values: list[Any], *, key: str) -> torch.Tensor | None:
     return torch.stack(values, dim=0)
 
 
-def collate_stage1_samples(
-    samples: list[dict[str, Any]], *, video_size: int, use_proprio: bool
+_TEMPORAL_DEBUG_PRINTED = False
+
+
+def _fix_clip_T(clip: torch.Tensor, target_T: int) -> torch.Tensor:
+    """Canonicalize a [C, T, H, W] clip to a fixed temporal length."""
+    target_T = int(target_T)
+    if target_T <= 0:
+        raise ValueError(f"target_T must be positive, got {target_T}.")
+    if not torch.is_tensor(clip):
+        raise ValueError(f"clip must be a tensor, got {type(clip)}.")
+    if clip.ndim != 4 or int(clip.shape[0]) != 3:
+        raise ValueError(f"clip must be [3, T, H, W], got {tuple(clip.shape)}.")
+    frames = int(clip.shape[1])
+    if frames <= 0:
+        raise ValueError(f"clip must have at least one frame, got shape {tuple(clip.shape)}.")
+    if frames == target_T:
+        return clip
+    if frames > target_T:
+        indices = torch.linspace(0, frames - 1, steps=target_T, device=clip.device).round().long()
+        return clip.index_select(1, indices)
+    pad_count = target_T - frames
+    pad = clip[:, -1:].expand(-1, pad_count, -1, -1)
+    return torch.cat([clip, pad], dim=1)
+
+
+def _canonicalize_stage1_sample_temporal(
+    sample: dict[str, Any], current_T: int, future_T: int
 ) -> dict[str, Any]:
+    current_T = int(current_T)
+    future_T = int(future_T)
+    if current_T <= 0 or future_T <= 0:
+        raise ValueError(f"current_T/future_T must be positive, got {current_T}/{future_T}.")
+
+    canonical = dict(sample)
+    video = canonical.get("video")
+    if not torch.is_tensor(video):
+        video = canonical.get("current_video")
+    if not torch.is_tensor(video):
+        source = canonical.get("source_name", canonical.get("dataset_name", "unknown"))
+        raise ValueError(f"{source} sample is missing tensor video/current_video.")
+    if video.ndim != 4 or int(video.shape[0]) != 3:
+        raise ValueError(f"video must be [3, T, H, W], got {tuple(video.shape)}.")
+
+    future_video = canonical.get("future_video")
+    if torch.is_tensor(future_video):
+        if future_video.ndim != 4 or int(future_video.shape[0]) != 3:
+            raise ValueError(f"future_video must be [3, T, H, W], got {tuple(future_video.shape)}.")
+        current_clip = _fix_clip_T(video, current_T)
+        future_clip = _fix_clip_T(future_video, future_T)
+    else:
+        frames = int(video.shape[1])
+        required = current_T + future_T
+        if frames >= required:
+            current_clip = video[:, :current_T]
+            future_clip = video[:, frames - future_T : frames]
+        else:
+            current_source = video[:, : min(frames, current_T)]
+            if frames > current_T:
+                future_source = video[:, current_T:]
+            else:
+                future_source = video[:, -1:]
+            current_clip = _fix_clip_T(current_source, current_T)
+            future_clip = _fix_clip_T(future_source, future_T)
+
+    canonical["video"] = current_clip.contiguous()
+    canonical["current_video"] = canonical["video"]
+    canonical["future_video"] = future_clip.contiguous()
+    return canonical
+
+
+def collate_stage1_samples(
+    samples: list[dict[str, Any]], *, video_size: int, use_proprio: bool, current_frame_count: int, future_frame_count: int
+) -> dict[str, Any]:
+    global _TEMPORAL_DEBUG_PRINTED
+    current_T = int(current_frame_count)
+    future_T = int(future_frame_count)
     videos = []
     future_videos = []
     contexts = []
@@ -670,30 +753,59 @@ def collate_stage1_samples(
     dataset_names = []
     prompts = []
     for sample in samples:
-        dataset_name = str(sample.get("dataset_name", "unknown"))
+        dataset_name = str(sample.get("dataset_name", sample.get("source_name", "unknown")))
         dataset_names.append(dataset_name)
         prompts.append(sample.get("prompt"))
 
-        video = sample.get("video")
-        future_video = sample.get("future_video")
+        raw_video = sample.get("video")
+        raw_future_video = sample.get("future_video")
+        raw_video_shape = tuple(raw_video.shape) if torch.is_tensor(raw_video) else None
+        raw_future_shape = tuple(raw_future_video.shape) if torch.is_tensor(raw_future_video) else None
+
+        sample = _canonicalize_stage1_sample_temporal(
+            sample,
+            current_T=current_T,
+            future_T=future_T,
+        )
+        video = resize_video(sample["video"], size=video_size)
+        future_video = resize_video(sample["future_video"], size=video_size)
+
+        assert int(video.shape[1]) == current_T
+        assert int(future_video.shape[1]) == future_T
+
+        if not _TEMPORAL_DEBUG_PRINTED and (
+            raw_video_shape != tuple(video.shape) or raw_future_shape != tuple(future_video.shape)
+        ):
+            print(
+                " ".join(
+                    [
+                        "stage1_temporal_canonicalized",
+                        f"source_name={dataset_name}",
+                        f"raw_video_shape={raw_video_shape}",
+                        f"raw_future_video_shape={raw_future_shape}",
+                        f"canonical_video_shape={tuple(video.shape)}",
+                        f"canonical_future_video_shape={tuple(future_video.shape)}",
+                    ]
+                ),
+                flush=True,
+            )
+            _TEMPORAL_DEBUG_PRINTED = True
+
         context = sample.get("context")
         context_mask = sample.get("context_mask")
-        if not torch.is_tensor(video):
-            raise ValueError(f"{dataset_name} sample is missing tensor video.")
         if not torch.is_tensor(context) or not torch.is_tensor(context_mask):
             raise ValueError(
                 f"{dataset_name} sample is missing context/context_mask tensors."
             )
-        videos.append(resize_video(video, size=video_size))
-        if torch.is_tensor(future_video):
-            future_videos.append(resize_video(future_video, size=video_size))
+        videos.append(video)
+        future_videos.append(future_video)
         contexts.append(context)
         context_masks.append(context_mask.bool())
         actions.append(sample.get("action"))
         proprios.append(sample.get("proprio"))
 
     video_batch = torch.stack(videos, dim=0)
-    future_video_batch = torch.stack(future_videos, dim=0) if len(future_videos) == len(videos) else None
+    future_video_batch = torch.stack(future_videos, dim=0)
     context_batch = maybe_stack_tensors(contexts, key="context")
     mask_batch = maybe_stack_tensors(context_masks, key="context_mask")
     if context_batch is None or mask_batch is None:
@@ -720,7 +832,6 @@ def collate_stage1_samples(
         "prompt": prompts,
         "source_counts": dict(Counter(dataset_names)),
     }
-
 
 def resolve_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -916,22 +1027,29 @@ def build_modules(
 def encode_videos(
     vjepa_encoder: torch.nn.Module,
     video: torch.Tensor,
+    future_video: torch.Tensor,
     *,
     current_frames: int,
     future_frames: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if video.ndim != 5 or video.shape[1] != 3:
-        raise ValueError(f"video must be [B, 3, T, H, W], got {tuple(video.shape)}.")
-    required = int(current_frames) + int(future_frames)
-    if int(video.shape[2]) < required:
-        raise ValueError(f"video has T={video.shape[2]}, required at least {required}.")
-    current_video = video[:, :, : int(current_frames)]
-    future_video = video[:, :, int(current_frames) : required]
+        raise ValueError(f"video must be current clip [B, 3, T, H, W], got {tuple(video.shape)}.")
+    if future_video.ndim != 5 or future_video.shape[1] != 3:
+        raise ValueError(
+            f"future_video must be future clip [B, 3, T, H, W], got {tuple(future_video.shape)}."
+        )
+    if int(video.shape[2]) != int(current_frames):
+        raise ValueError(
+            f"current video T={video.shape[2]} does not match current_frame_count={current_frames}."
+        )
+    if int(future_video.shape[2]) != int(future_frames):
+        raise ValueError(
+            f"future video T={future_video.shape[2]} does not match future_frame_count={future_frames}."
+        )
     with torch.no_grad():
-        current_tokens = vjepa_encoder(current_video)
+        current_tokens = vjepa_encoder(video)
         target_future_tokens = vjepa_encoder(future_video).detach()
     return current_tokens, target_future_tokens
-
 
 def future_cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return 1.0 - F.cosine_similarity(pred.float(), target.float(), dim=-1).mean()
@@ -987,12 +1105,24 @@ def save_checkpoint(
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"checkpoint_step_{int(step):06d}.pt"
+    explicit_stage1_config = {
+        "current_frame_count": int(args.current_frame_count),
+        "future_frame_count": int(args.future_frame_count),
+        "video_size": int(args.video_size),
+        "vjepa_img_size": int(args.vjepa_img_size),
+        "future_predictor_layers": int(args.future_predictor_layers),
+        "future_predictor_hidden_dim": int(args.future_predictor_hidden_dim),
+        "future_predictor_heads": int(args.future_predictor_heads),
+    }
+    checkpoint_config = dict(vars(args))
+    checkpoint_config.update(explicit_stage1_config)
     payload = {
         "future_predictor": unwrap_ddp(predictor).state_dict(),
         "jepa_adapter": unwrap_ddp(adapter).state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": int(step),
-        "config": vars(args),
+        "config": checkpoint_config,
+        "stage1_temporal_config": explicit_stage1_config,
         "vjepa2ac_load_stats": load_stats,
         "vjepa2ac_block_summary": predictor_block_load_summary(load_stats or {}),
         "loss_dict": dict(loss_dict),
@@ -1076,6 +1206,8 @@ def main() -> None:
         video_size=int(args.video_size),
         seed=int(getattr(args, "_rank_seed", args.seed)),
         use_proprio=bool(args.use_proprio),
+        current_frame_count=int(args.current_frame_count),
+        future_frame_count=int(args.future_frame_count),
     )
 
     first_batch = batcher.next_batch()
@@ -1088,6 +1220,7 @@ def main() -> None:
     print(f"inferred_proprio_dim={proprio_dim}", flush=True)
     print(f"first_batch_source_counts={first_batch['source_counts']}", flush=True)
     print(f"first_batch_video_shape={tuple(first_batch['video'].shape)}", flush=True)
+    print(f"first_batch_future_video_shape={tuple(first_batch['future_video'].shape)}", flush=True)
     print(
         f"first_batch_context_shape={tuple(first_batch['context'].shape)}", flush=True
     )
@@ -1194,6 +1327,7 @@ def main() -> None:
             current_tokens, target_future_tokens = encode_videos(
                 vjepa_encoder,
                 batch["video"],
+                batch["future_video"],
                 current_frames=int(args.current_frame_count),
                 future_frames=int(args.future_frame_count),
             )
@@ -1334,6 +1468,15 @@ def main() -> None:
                     "dataset_sampling_ratio": mix,
                     "vjepa2ac_load_stats": load_stats,
                     "vjepa2ac_block_summary": predictor_block_load_summary(load_stats),
+                    "stage1_temporal_config": {
+                        "current_frame_count": int(args.current_frame_count),
+                        "future_frame_count": int(args.future_frame_count),
+                        "video_size": int(args.video_size),
+                        "vjepa_img_size": int(args.vjepa_img_size),
+                        "future_predictor_layers": int(args.future_predictor_layers),
+                        "future_predictor_hidden_dim": int(args.future_predictor_hidden_dim),
+                        "future_predictor_heads": int(args.future_predictor_heads),
+                    },
                     "args": vars(args),
                     "ddp": {
                         "enabled": ddp_enabled,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -104,6 +105,266 @@ class MixedDemoBatcher:
             samples, video_size=self.video_size, use_proprio=self.use_proprio
         )
 
+class RoboTwin2Stage1Dataset(torch.utils.data.Dataset):
+    """Fast Stage-1 RoboTwin loader for LeRobot-style local datasets.
+
+    This avoids constructing LeRobotDataset, which validates every episode file
+    during initialization. Only meta/info.json and meta/episodes.jsonl are read
+    up front; parquet/mp4 paths are derived and optionally checked for selected
+    sampled episodes inside __getitem__.
+    """
+
+    def __init__(
+        self,
+        *,
+        root: str | Path,
+        camera_key: str,
+        current_frame_count: int,
+        future_frame_count: int,
+        context_len: int,
+        text_dim: int,
+        text_embedding_cache_dir: str | None = None,
+        max_episodes: int | None = None,
+        validate_files: str = "selected",
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        self.root = Path(root).resolve()
+        self.camera_key = str(camera_key)
+        self.current_frame_count = int(current_frame_count)
+        self.future_frame_count = int(future_frame_count)
+        self.total_frames = self.current_frame_count + self.future_frame_count
+        self.context_len = int(context_len)
+        self.text_dim = int(text_dim)
+        self.text_embedding_cache_dir = resolve_path(text_embedding_cache_dir) if text_embedding_cache_dir is not None else None
+        self.max_episodes = None if max_episodes is None else int(max_episodes)
+        if self.max_episodes is not None and self.max_episodes <= 0:
+            raise ValueError(f"max_episodes must be positive when set, got {self.max_episodes}.")
+        self.validate_files = str(validate_files)
+        self.rng = random.Random(int(seed))
+        self._warned_missing_context = False
+
+        if self.current_frame_count <= 0 or self.future_frame_count <= 0:
+            raise ValueError(
+                "current_frame_count and future_frame_count must be positive, "
+                f"got {self.current_frame_count}/{self.future_frame_count}."
+            )
+        if self.context_len <= 0 or self.text_dim <= 0:
+            raise ValueError(f"context_len/text_dim must be positive, got {self.context_len}/{self.text_dim}.")
+        if self.validate_files not in {"none", "selected"}:
+            raise ValueError(f"validate_files must be 'none' or 'selected', got {self.validate_files!r}.")
+        for relative in ("meta", "data", "videos"):
+            path = self.root / relative
+            if not path.exists():
+                raise FileNotFoundError(f"RoboTwin fast loader expected {relative}/ under root: {path}")
+
+        info_path = self.root / "meta" / "info.json"
+        episodes_path = self.root / "meta" / "episodes.jsonl"
+        if not info_path.exists():
+            raise FileNotFoundError(f"RoboTwin meta/info.json not found: {info_path}")
+        if not episodes_path.exists():
+            raise FileNotFoundError(f"RoboTwin meta/episodes.jsonl not found: {episodes_path}")
+        self.info = json.loads(info_path.read_text(encoding="utf-8"))
+        self.data_path_template = str(self.info.get("data_path", "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"))
+        video_template = self.info.get("video_path")
+        if video_template is None:
+            raise ValueError("RoboTwin fast loader requires info['video_path']; got None.")
+        self.video_path_template = str(video_template)
+        self.chunks_size = int(self.info.get("chunks_size", 1000))
+        if self.chunks_size <= 0:
+            raise ValueError(f"info['chunks_size'] must be positive, got {self.chunks_size}.")
+
+        episodes: list[dict[str, Any]] = []
+        with episodes_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                episodes.append(json.loads(line))
+                if self.max_episodes is not None and len(episodes) >= self.max_episodes:
+                    break
+        if not episodes:
+            raise ValueError(f"No episodes found in {episodes_path}")
+        self.episodes = episodes
+        self.tasks_by_index = self._load_tasks_by_index()
+
+    def __len__(self) -> int:
+        return len(self.episodes)
+
+    def _episode_index(self, episode: dict[str, Any]) -> int:
+        if "episode_index" not in episode:
+            raise ValueError(f"Episode entry is missing episode_index: {episode}")
+        return int(episode["episode_index"])
+
+    def _episode_chunk(self, episode_index: int) -> int:
+        return int(episode_index) // self.chunks_size
+
+    def data_file_path(self, episode_index: int) -> Path:
+        return self.root / self.data_path_template.format(
+            episode_chunk=self._episode_chunk(episode_index),
+            episode_index=int(episode_index),
+        )
+
+    def video_file_path(self, episode_index: int) -> Path:
+        return self.root / self.video_path_template.format(
+            episode_chunk=self._episode_chunk(episode_index),
+            video_key=self.camera_key,
+            episode_index=int(episode_index),
+        )
+
+    def _validate_selected_files(self, episode_index: int) -> None:
+        if self.validate_files == "none":
+            return
+        data_path = self.data_file_path(episode_index)
+        video_path = self.video_file_path(episode_index)
+        if not data_path.exists():
+            raise FileNotFoundError(f"Selected RoboTwin episode parquet not found: {data_path}")
+        if not video_path.exists():
+            raise FileNotFoundError(f"Selected RoboTwin episode video not found: {video_path}")
+
+    def _load_tasks_by_index(self) -> dict[int, str]:
+        path = self.root / "meta" / "tasks.jsonl"
+        if not path.exists():
+            return {}
+        mapping: dict[int, str] = {}
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                if "task_index" in item:
+                    task = item.get("task") or item.get("instruction") or item.get("name")
+                    if task is not None:
+                        mapping[int(item["task_index"])] = str(task)
+        return mapping
+
+    def _episode_instruction(self, episode: dict[str, Any]) -> str:
+        for key in ("instruction", "task", "language_instruction"):
+            if key in episode and episode[key] is not None:
+                return str(episode[key])
+        tasks = episode.get("tasks")
+        if isinstance(tasks, list) and tasks:
+            return str(tasks[0])
+        task_index = episode.get("task_index")
+        if task_index is not None and int(task_index) in self.tasks_by_index:
+            return self.tasks_by_index[int(task_index)]
+        return "robotwin demonstration"
+
+    def _prompt(self, episode: dict[str, Any]) -> str:
+        return f"A video recorded from a robot's point of view executing the following instruction: {self._episode_instruction(episode)}"
+
+    def _context_from_prompt(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.text_embedding_cache_dir is not None:
+            hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            cache_path = self.text_embedding_cache_dir / f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt"
+            if cache_path.exists():
+                payload = torch.load(cache_path, map_location="cpu")
+                context = payload["context"]
+                mask = payload["mask"].bool()
+                if context.ndim != 2 or tuple(context.shape) != (self.context_len, self.text_dim):
+                    raise ValueError(
+                        f"Cached context shape must be {(self.context_len, self.text_dim)}, "
+                        f"got {tuple(context.shape)} in {cache_path}"
+                    )
+                if mask.ndim != 1 or mask.shape[0] != self.context_len:
+                    raise ValueError(f"Cached mask shape must be [{self.context_len}], got {tuple(mask.shape)} in {cache_path}")
+                context = context.clone()
+                context[~mask] = 0.0
+                return context, torch.ones_like(mask, dtype=torch.bool)
+            if not self._warned_missing_context:
+                print(
+                    "RoboTwin fast loader warning: missing text embedding cache for at least one prompt; "
+                    "using zero context tokens for those episodes.",
+                    flush=True,
+                )
+                self._warned_missing_context = True
+        return torch.zeros(self.context_len, self.text_dim, dtype=torch.float32), torch.ones(self.context_len, dtype=torch.bool)
+
+    @staticmethod
+    def _table_to_tensors(path: Path) -> dict[str, torch.Tensor]:
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(str(path))
+        result: dict[str, torch.Tensor] = {}
+        for col_name in table.column_names:
+            col = table[col_name]
+            try:
+                arr = col.to_numpy(zero_copy_only=True)
+            except Exception:
+                raw = col.to_numpy()
+                try:
+                    import numpy as np
+
+                    arr = np.stack(raw) if raw.dtype == object else raw
+                except Exception:
+                    continue
+            if getattr(arr, "dtype", None) is not None and str(arr.dtype) != "object":
+                result[col_name] = torch.as_tensor(arr)
+        return result
+
+    @staticmethod
+    def _first_existing_tensor(data: dict[str, torch.Tensor], candidates: tuple[str, ...]) -> torch.Tensor | None:
+        for key in candidates:
+            value = data.get(key)
+            if torch.is_tensor(value):
+                return value.float()
+        return None
+
+    def _load_video(self, path: Path) -> torch.Tensor:
+        from torchvision.io import read_video
+
+        video, _, _ = read_video(str(path), pts_unit="sec", output_format="TCHW")
+        if video.ndim != 4 or video.shape[1] != 3:
+            raise ValueError(f"Decoded RoboTwin video must be [T, 3, H, W], got {tuple(video.shape)} from {path}")
+        if video.shape[0] <= 0:
+            raise ValueError(f"Decoded RoboTwin video has no frames: {path}")
+        video = video.float() / 127.5 - 1.0
+        return video.permute(1, 0, 2, 3).contiguous()
+
+    def _select_clip(self, video: torch.Tensor) -> torch.Tensor:
+        frames = int(video.shape[1])
+        if frames >= self.total_frames:
+            start = self.rng.randint(0, frames - self.total_frames)
+            return video[:, start : start + self.total_frames]
+        pad_count = self.total_frames - frames
+        pad = video[:, -1:].expand(-1, pad_count, -1, -1)
+        return torch.cat([video, pad], dim=1)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        episode = self.episodes[int(idx) % len(self.episodes)]
+        episode_index = self._episode_index(episode)
+        self._validate_selected_files(episode_index)
+        data_path = self.data_file_path(episode_index)
+        video_path = self.video_file_path(episode_index)
+        prompt = self._prompt(episode)
+        context, context_mask = self._context_from_prompt(prompt)
+        video = self._select_clip(self._load_video(video_path))
+
+        parquet_tensors: dict[str, torch.Tensor] = {}
+        if data_path.exists():
+            parquet_tensors = self._table_to_tensors(data_path)
+        action = self._first_existing_tensor(parquet_tensors, ("action", "action.default"))
+        proprio = self._first_existing_tensor(
+            parquet_tensors,
+            ("observation.state", "proprio", "state", "observation.proprio"),
+        )
+        return {
+            "video": video,
+            "current_video": video[:, : self.current_frame_count],
+            "future_video": video[:, self.current_frame_count : self.total_frames],
+            "context": context,
+            "context_mask": context_mask,
+            "proprio": proprio,
+            "action": action,
+            "prompt": prompt,
+            "dataset_name": "robotwin",
+            "source_name": "robotwin",
+            "episode_index": episode_index,
+            "data_path": str(data_path),
+            "video_path": str(video_path),
+        }
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -117,6 +378,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robotwin-task", default="robotwin_joint_3cam_384_1e-4")
     parser.add_argument("--libero-data-root", default=None)
     parser.add_argument("--robotwin-data-root", default=None)
+    parser.add_argument("--robotwin-loader", default="fast", choices=["lerobot", "fast"])
+    parser.add_argument("--max-robotwin-episodes", type=int, default=None)
+    parser.add_argument("--robotwin-camera-key", default="observation.images.cam_high")
+    parser.add_argument("--debug-dataset-only", action="store_true", default=False)
+    parser.add_argument("--num-debug-samples", type=int, default=4)
+    parser.add_argument("--robotwin-validate-files", default="selected", choices=["none", "selected"])
     parser.add_argument("--dataset-mix", default="libero:0.5,robotwin:0.5")
     parser.add_argument("--vjepa-repo", default=DEFAULT_VJEPA_REPO)
     parser.add_argument("--vjepa-checkpoint", default=DEFAULT_VJEPA_CHECKPOINT)
@@ -285,6 +552,8 @@ def resolve_dataset_dirs_from_cfg(
 
 
 def build_source_dataset(*, source: str, args: argparse.Namespace):
+    start_time = time.time()
+    print(f"build_source_dataset_start source={source}", flush=True)
     task = args.libero_task if source == "libero" else args.robotwin_task
     cfg = compose_cfg(args.config_name, task)
     override_root = (
@@ -295,9 +564,69 @@ def build_source_dataset(*, source: str, args: argparse.Namespace):
     )
     cfg.data.train.dataset_dirs = dataset_dirs
     print(f"{source}_dataset_dirs={dataset_dirs}", flush=True)
-    dataset = instantiate(cfg.data.train)
+
+    if source == "robotwin" and args.robotwin_loader == "fast":
+        if len(dataset_dirs) != 1:
+            raise ValueError(
+                f"RoboTwin fast loader expects exactly one dataset root, got {dataset_dirs}."
+            )
+        model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
+        if not isinstance(model_cfg, dict):
+            raise ValueError(f"cfg.model must resolve to dict, got {type(model_cfg)}.")
+        action_cfg = dict(model_cfg["action_dit_config"])
+        dataset = RoboTwin2Stage1Dataset(
+            root=dataset_dirs[0],
+            camera_key=str(args.robotwin_camera_key),
+            current_frame_count=int(args.current_frame_count),
+            future_frame_count=int(args.future_frame_count),
+            context_len=int(cfg.data.train.get("context_len", 128)),
+            text_dim=int(action_cfg["text_dim"]),
+            text_embedding_cache_dir=cfg.data.train.get("text_embedding_cache_dir"),
+            max_episodes=args.max_robotwin_episodes,
+            validate_files=str(args.robotwin_validate_files),
+            seed=int(args.seed),
+        )
+    else:
+        dataset = instantiate(cfg.data.train)
+
+    elapsed = time.time() - start_time
+    print(
+        f"build_source_dataset_done source={source} len={len(dataset)} init_time_sec={elapsed:.3f}",
+        flush=True,
+    )
     print(f"{source}_dataset={type(dataset).__name__} len={len(dataset)}", flush=True)
     return dataset
+
+def print_debug_dataset_samples(datasets: dict[str, Any], *, num_samples: int) -> None:
+    for source, dataset in datasets.items():
+        print(f"debug_dataset source={source} len={len(dataset)} type={type(dataset).__name__}", flush=True)
+        limit = min(int(num_samples), len(dataset))
+        for idx in range(limit):
+            sample = dataset[idx]
+            if not isinstance(sample, dict):
+                raise ValueError(f"Debug sample from {source} is {type(sample)}, expected dict.")
+            video = sample.get("video")
+            current_video = sample.get("current_video")
+            future_video = sample.get("future_video")
+            source_name = sample.get("source_name", sample.get("dataset_name", source))
+            keys = sorted(str(key) for key in sample.keys())
+            video_shape = tuple(video.shape) if torch.is_tensor(video) else None
+            current_shape = tuple(current_video.shape) if torch.is_tensor(current_video) else None
+            future_shape = tuple(future_video.shape) if torch.is_tensor(future_video) else None
+            print(
+                " ".join(
+                    [
+                        f"debug_sample source={source}",
+                        f"idx={idx}",
+                        f"source_name={source_name}",
+                        f"keys={keys}",
+                        f"video_shape={video_shape}",
+                        f"current_video_shape={current_shape}",
+                        f"future_video_shape={future_shape}",
+                    ]
+                ),
+                flush=True,
+            )
 
 
 def resize_video(video: torch.Tensor, *, size: int) -> torch.Tensor:
@@ -326,6 +655,7 @@ def collate_stage1_samples(
     samples: list[dict[str, Any]], *, video_size: int, use_proprio: bool
 ) -> dict[str, Any]:
     videos = []
+    future_videos = []
     contexts = []
     context_masks = []
     actions = []
@@ -338,6 +668,7 @@ def collate_stage1_samples(
         prompts.append(sample.get("prompt"))
 
         video = sample.get("video")
+        future_video = sample.get("future_video")
         context = sample.get("context")
         context_mask = sample.get("context_mask")
         if not torch.is_tensor(video):
@@ -347,12 +678,15 @@ def collate_stage1_samples(
                 f"{dataset_name} sample is missing context/context_mask tensors."
             )
         videos.append(resize_video(video, size=video_size))
+        if torch.is_tensor(future_video):
+            future_videos.append(resize_video(future_video, size=video_size))
         contexts.append(context)
         context_masks.append(context_mask.bool())
         actions.append(sample.get("action"))
         proprios.append(sample.get("proprio"))
 
     video_batch = torch.stack(videos, dim=0)
+    future_video_batch = torch.stack(future_videos, dim=0) if len(future_videos) == len(videos) else None
     context_batch = maybe_stack_tensors(contexts, key="context")
     mask_batch = maybe_stack_tensors(context_masks, key="context_mask")
     if context_batch is None or mask_batch is None:
@@ -369,11 +703,13 @@ def collate_stage1_samples(
 
     return {
         "video": video_batch,
+        "future_video": future_video_batch,
         "context": context_batch,
         "context_mask": mask_batch,
         "proprio": proprio_batch if use_proprio else None,
         "action": action_batch,
         "dataset_name": dataset_names,
+        "source_name": dataset_names,
         "prompt": prompts,
         "source_counts": dict(Counter(dataset_names)),
     }
@@ -649,6 +985,11 @@ def main() -> None:
     datasets = {
         source: build_source_dataset(source=source, args=args) for source in mix
     }
+    if args.debug_dataset_only:
+        print_debug_dataset_samples(datasets, num_samples=int(args.num_debug_samples))
+        print("debug_dataset_only_done", flush=True)
+        return
+
     sources = {
         source: InfiniteSourceIterator(
             name=source,

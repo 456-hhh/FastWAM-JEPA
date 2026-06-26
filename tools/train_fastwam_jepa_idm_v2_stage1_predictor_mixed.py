@@ -88,6 +88,8 @@ class MixedDemoBatcher:
         video_size: int,
         seed: int,
         use_proprio: bool,
+        stage1_drop_action_proprio: bool,
+        rank: int,
         current_frame_count: int,
         future_frame_count: int,
     ) -> None:
@@ -97,6 +99,8 @@ class MixedDemoBatcher:
         self.video_size = int(video_size)
         self.rng = random.Random(int(seed))
         self.use_proprio = bool(use_proprio)
+        self.stage1_drop_action_proprio = bool(stage1_drop_action_proprio)
+        self.rank = int(rank)
         self.current_frame_count = int(current_frame_count)
         self.future_frame_count = int(future_frame_count)
         if self.batch_size <= 0:
@@ -113,6 +117,8 @@ class MixedDemoBatcher:
             samples,
             video_size=self.video_size,
             use_proprio=self.use_proprio,
+            stage1_drop_action_proprio=self.stage1_drop_action_proprio,
+            rank=self.rank,
             current_frame_count=self.current_frame_count,
             future_frame_count=self.future_frame_count,
         )
@@ -435,6 +441,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use-proprio", action="store_true", default=False)
+    parser.add_argument("--stage1-drop-action-proprio", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--ddp-find-unused-parameters", action=argparse.BooleanOptionalAction, default=False)
@@ -658,17 +665,22 @@ def resize_video(video: torch.Tensor, *, size: int) -> torch.Tensor:
     return x.to(dtype=video.dtype).permute(1, 0, 2, 3)
 
 
-def maybe_stack_tensors(values: list[Any], *, key: str) -> torch.Tensor | None:
+def maybe_stack_tensors(
+    values: list[Any], *, key: str, print_once: bool = False, rank: int = 0
+) -> torch.Tensor | None:
     if not all(torch.is_tensor(value) for value in values):
         return None
     shapes = [tuple(value.shape) for value in values]
     if len(set(shapes)) != 1:
-        print(f"batch_{key}_not_stacked_due_to_shape_mismatch={shapes}", flush=True)
+        if int(rank) == 0 and (not print_once or key not in _STACK_MISMATCH_DEBUG_PRINTED_KEYS):
+            print(f"batch_{key}_not_stacked_due_to_shape_mismatch={shapes}", flush=True)
+            _STACK_MISMATCH_DEBUG_PRINTED_KEYS.add(key)
         return None
     return torch.stack(values, dim=0)
 
 
 _TEMPORAL_DEBUG_PRINTED = False
+_STACK_MISMATCH_DEBUG_PRINTED_KEYS: set[str] = set()
 
 
 def _fix_clip_T(clip: torch.Tensor, target_T: int) -> torch.Tensor:
@@ -739,7 +751,7 @@ def _canonicalize_stage1_sample_temporal(
 
 
 def collate_stage1_samples(
-    samples: list[dict[str, Any]], *, video_size: int, use_proprio: bool, current_frame_count: int, future_frame_count: int
+    samples: list[dict[str, Any]], *, video_size: int, use_proprio: bool, current_frame_count: int, future_frame_count: int, stage1_drop_action_proprio: bool = True, rank: int = 0
 ) -> dict[str, Any]:
     global _TEMPORAL_DEBUG_PRINTED
     current_T = int(current_frame_count)
@@ -748,6 +760,8 @@ def collate_stage1_samples(
     future_videos = []
     contexts = []
     context_masks = []
+    collect_action = not bool(stage1_drop_action_proprio)
+    collect_proprio = bool(use_proprio) or not bool(stage1_drop_action_proprio)
     actions = []
     proprios = []
     dataset_names = []
@@ -801,8 +815,10 @@ def collate_stage1_samples(
         future_videos.append(future_video)
         contexts.append(context)
         context_masks.append(context_mask.bool())
-        actions.append(sample.get("action"))
-        proprios.append(sample.get("proprio"))
+        if collect_action:
+            actions.append(sample.get("action"))
+        if collect_proprio:
+            proprios.append(sample.get("proprio"))
 
     video_batch = torch.stack(videos, dim=0)
     future_video_batch = torch.stack(future_videos, dim=0)
@@ -813,8 +829,16 @@ def collate_stage1_samples(
             "Mixed dataset context/context_mask shapes must match exactly; no silent projection is applied."
         )
 
-    action_batch = maybe_stack_tensors(actions, key="action")
-    proprio_batch = maybe_stack_tensors(proprios, key="proprio")
+    action_batch = (
+        maybe_stack_tensors(actions, key="action", print_once=True, rank=rank)
+        if collect_action
+        else None
+    )
+    proprio_batch = (
+        maybe_stack_tensors(proprios, key="proprio", print_once=True, rank=rank)
+        if collect_proprio
+        else None
+    )
     if use_proprio and proprio_batch is None:
         raise ValueError(
             "--use-proprio requires all mixed sources to have matching proprio tensor shapes."
@@ -1326,6 +1350,8 @@ def main() -> None:
         video_size=int(args.video_size),
         seed=int(getattr(args, "_rank_seed", args.seed)),
         use_proprio=bool(args.use_proprio),
+        stage1_drop_action_proprio=bool(args.stage1_drop_action_proprio),
+        rank=int(rank),
         current_frame_count=int(args.current_frame_count),
         future_frame_count=int(args.future_frame_count),
     )

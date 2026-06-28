@@ -72,6 +72,21 @@ def parse_args() -> argparse.Namespace:
         "--save-videos", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument("--debug-first-steps", type=int, default=0)
+    parser.add_argument("--context-suite", default=None, choices=LIBERO_SUITES)
+    parser.add_argument("--context-task-id", default=None)
+    parser.add_argument(
+        "--zero-context", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--debug-context-fingerprint",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--compare-context-actions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
 
     parser.add_argument("--config-name", default="train")
     parser.add_argument("--task", default="libero_idm_2cam224_1e-4")
@@ -575,6 +590,171 @@ def _format_vector(value: Any, *, max_items: int = 16) -> str:
     return f"[{body}]"
 
 
+def _sanitize_fastwam_seed(args: argparse.Namespace) -> int:
+    safe_seed = int(args.seed)
+    if safe_seed <= 0:
+        print("WARNING --seed must be >0 for FastWAM set_global_seed; using seed=1", flush=True)
+        safe_seed = 1
+    args.effective_seed = safe_seed
+    return safe_seed
+
+
+def _postprocess_env_action(pred_action: Any, processor, args: argparse.Namespace) -> np.ndarray:
+    action = rollout_base._denormalize_action(pred_action, processor)[0]
+    action[..., -1] = action[..., -1] * 2 - 1
+
+    from experiments.libero.libero_utils import invert_gripper_action
+
+    action = invert_gripper_action(action)
+    if bool(args.binarize_gripper):
+        action[..., -1] = np.sign(action[..., -1])
+    return action
+
+
+def _context_fingerprint(context: torch.Tensor) -> dict[str, Any]:
+    data = context.detach().float().reshape(-1).cpu()
+    return {
+        "norm": float(data.norm().item()),
+        "sum": float(data.sum().item()),
+        "first8": data[:8].numpy() if data.numel() else np.asarray([], dtype=np.float32),
+    }
+
+
+def _print_context_fingerprint(label: str, description: str, context: torch.Tensor) -> None:
+    fp = _context_fingerprint(context)
+    print(f"CONTEXT {label} description={description.replace(chr(10), ' ')}", flush=True)
+    print(
+        f"CONTEXT {label} norm={fp['norm']:.6g} sum={fp['sum']:.6g} "
+        f"first8={_format_vector(fp['first8'], max_items=8)}",
+        flush=True,
+    )
+
+
+def _action_chunk_stats(action: Any) -> dict[str, Any]:
+    array = np.asarray(action, dtype=np.float32)
+    first_action = np.asarray([], dtype=np.float32)
+    if array.size and array.ndim >= 1 and int(array.shape[-1]) > 0:
+        first_action = array.reshape(-1, int(array.shape[-1]))[0]
+    return {
+        "shape": tuple(array.shape),
+        "min": float(array.min()) if array.size else float("nan"),
+        "max": float(array.max()) if array.size else float("nan"),
+        "mean": float(array.mean()) if array.size else float("nan"),
+        "std": float(array.std()) if array.size else float("nan"),
+        "first_action": first_action,
+    }
+
+
+def _print_context_action_group(
+    label: str,
+    *,
+    description: str,
+    context: torch.Tensor,
+    action_chunk: np.ndarray,
+) -> None:
+    fp = _context_fingerprint(context)
+    stats = _action_chunk_stats(action_chunk)
+    print(f"COMPARE {label} context_description={description.replace(chr(10), ' ')}", flush=True)
+    print(
+        f"COMPARE {label} context norm={fp['norm']:.6g} sum={fp['sum']:.6g} "
+        f"first8={_format_vector(fp['first8'], max_items=8)}",
+        flush=True,
+    )
+    print(
+        f"COMPARE {label} action_chunk shape={stats['shape']} min={stats['min']:.6g} "
+        f"max={stats['max']:.6g} mean={stats['mean']:.6g} std={stats['std']:.6g}",
+        flush=True,
+    )
+    print(
+        f"COMPARE {label} first_action={_format_vector(stats['first_action'])}",
+        flush=True,
+    )
+
+
+def _action_pair_metrics(left: Any, right: Any) -> tuple[float, float, float]:
+    left_array = np.asarray(left, dtype=np.float32).reshape(-1)
+    right_array = np.asarray(right, dtype=np.float32).reshape(-1)
+    if left_array.shape != right_array.shape:
+        raise ValueError(f"Cannot compare action chunks with shapes {left_array.shape} and {right_array.shape}.")
+    diff = left_array - right_array
+    left_norm = float(np.linalg.norm(left_array))
+    right_norm = float(np.linalg.norm(right_array))
+    denom = max(left_norm * right_norm, 1e-12)
+    cosine = float(np.dot(left_array, right_array) / denom)
+    return float(np.linalg.norm(diff)), float(np.max(np.abs(diff))), cosine
+
+
+def _print_action_pair(label: str, left: Any, right: Any) -> None:
+    l2, max_abs, cosine = _action_pair_metrics(left, right)
+    print(
+        f"COMPARE diff {label} L2={l2:.6g} max_abs_diff={max_abs:.6g} cosine={cosine:.6g}",
+        flush=True,
+    )
+
+
+def _task_description_from_task(task: Any) -> str:
+    for attr in ("language", "task_description", "description", "name"):
+        value = getattr(task, attr, None)
+        if value:
+            return str(value)
+    raise ValueError("LIBERO task object does not expose a text description.")
+
+
+def _load_context_for_suite_task(
+    *,
+    benchmark_dict: dict[str, Any],
+    suite_name: str,
+    task_id: int,
+    cfg: DictConfig,
+    default_prompt: str,
+) -> dict[str, Any]:
+    task_suite = benchmark_dict[str(suite_name)]()
+    task = task_suite.get_task(int(task_id))
+    description = _task_description_from_task(task)
+    prompt = default_prompt.format(task=description)
+    context, context_mask = rollout_base.load_cached_text_context(prompt, cfg)
+    return {
+        "suite": str(suite_name),
+        "task_id": int(task_id),
+        "description": description,
+        "prompt": prompt,
+        "context": context,
+        "context_mask": context_mask,
+    }
+
+
+@torch.no_grad()
+def _sample_context_action_chunk(
+    *,
+    model: torch.nn.Module,
+    processor,
+    args: argparse.Namespace,
+    current_video: torch.Tensor,
+    proprio: torch.Tensor | None,
+    context: torch.Tensor,
+    context_mask: torch.Tensor,
+    action_horizon: int,
+    episode_seed: int,
+) -> np.ndarray:
+    if str(args.future_source) == "oracle":
+        raise ValueError("--compare-context-actions does not support --future-source oracle.")
+    pred = rollout_base.sample_action_jepa_idm(
+        model=model,
+        current_video=current_video,
+        context=context,
+        context_mask=context_mask,
+        proprio=proprio,
+        action_horizon=action_horizon,
+        future_source=str(args.future_source),
+        oracle_future_video=None,
+        num_inference_steps=int(args.num_inference_steps),
+        sigma_shift=args.sigma_shift,
+        seed=int(episode_seed),
+        rand_device=str(args.rand_device),
+    )
+    return _postprocess_env_action(pred["action"], processor, args)
+
+
 @torch.no_grad()
 def _debug_model_context_stats(
     *,
@@ -765,14 +945,7 @@ def predict_env_action_chunk(
         seed=episode_seed,
         rand_device=str(args.rand_device),
     )
-    action = rollout_base._denormalize_action(pred["action"], processor)[0]
-    action[..., -1] = action[..., -1] * 2 - 1
-
-    from experiments.libero.libero_utils import invert_gripper_action
-
-    action = invert_gripper_action(action)
-    if bool(args.binarize_gripper):
-        action[..., -1] = np.sign(action[..., -1])
+    action = _postprocess_env_action(pred["action"], processor, args)
 
     debug_stats: dict[str, Any] = {}
     if debug_requested:
@@ -953,6 +1126,179 @@ def run_rollout_episode(
     }
 
 
+def _resolve_compare_context_c(
+    *,
+    benchmark_dict: dict[str, Any],
+    cfg: DictConfig,
+    default_prompt: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    try:
+        return _load_context_for_suite_task(
+            benchmark_dict=benchmark_dict,
+            suite_name="libero_10",
+            task_id=2,
+            cfg=cfg,
+            default_prompt=default_prompt,
+        )
+    except Exception as exc:
+        if args.context_suite is None or args.context_task_id is None:
+            raise ValueError(
+                "Could not load libero_10 task2 context; pass --context-suite and "
+                "--context-task-id to provide a fallback context."
+            ) from exc
+        print(
+            f"WARNING libero_10 task2 context unavailable ({type(exc).__name__}); "
+            f"using {args.context_suite} task {args.context_task_id}.",
+            flush=True,
+        )
+        return _load_context_for_suite_task(
+            benchmark_dict=benchmark_dict,
+            suite_name=str(args.context_suite),
+            task_id=int(args.context_task_id),
+            cfg=cfg,
+            default_prompt=default_prompt,
+        )
+
+
+def run_context_action_compare(
+    *,
+    cfg: DictConfig,
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+) -> None:
+    from libero.libero import benchmark
+
+    from experiments.libero.libero_utils import LIBERO_ENV_RESOLUTION, get_libero_env
+    from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
+    from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+    from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+    from fastwam.utils.pytorch_utils import set_global_seed
+
+    if str(args.task_id).lower() == "all":
+        raise ValueError("--compare-context-actions requires a single --task-id, not 'all'.")
+    safe_seed = _sanitize_fastwam_seed(args)
+    set_global_seed(safe_seed, get_worker_init_fn=False)
+    stats_path = resolve_dataset_stats_path(cfg, args)
+    dataset_stats = load_dataset_stats_from_json(str(stats_path))
+    processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
+    processor.set_normalizer_from_stats(dataset_stats)
+
+    video_size = cfg.data.train.get("video_size", [224, 224])
+    input_h = int(video_size[0])
+    input_w = int(video_size[1])
+    action_horizon = int(args.action_horizon)
+    if action_horizon <= 0:
+        raise ValueError(f"--action-horizon must be positive, got {action_horizon}.")
+
+    benchmark_dict = benchmark.get_benchmark_dict()
+    task_suite = benchmark_dict[str(args.libero_suite)]()
+    task_id = int(args.task_id)
+    task = task_suite.get_task(task_id)
+    initial_states = list(task_suite.get_task_init_states(task_id))
+    if not initial_states:
+        raise ValueError(f"No initial states found for {args.libero_suite} task {task_id}.")
+
+    env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, safe_seed)
+    try:
+        env.reset()
+        obs = env.set_init_state(initial_states[0])
+        image, proprio, _ = rollout_base._obs_to_model_input(
+            obs,
+            cfg=cfg,
+            processor=processor,
+            width=input_w,
+            height=input_h,
+            device=model._runtime_device(),
+            dtype=model.torch_dtype,
+        )
+    finally:
+        close = getattr(env, "close", None)
+        if callable(close):
+            close()
+
+    frame_history = rollout_base.FrameHistory(frame_count=int(args.current_frame_count))
+    frame_history.append(image)
+    raw_current_video = frame_history.as_video()
+    model_current_video = _resize_model_video(
+        raw_current_video,
+        frame_count=int(args.current_frame_count),
+        size=int(args.vjepa_img_size),
+        name="current_video",
+    )
+
+    prompt_a = DEFAULT_PROMPT.format(task=task_description)
+    context_a, context_mask_a = rollout_base.load_cached_text_context(prompt_a, cfg)
+    context_b = torch.zeros_like(context_a)
+    context_mask_b = context_mask_a.clone()
+    context_c_info = _resolve_compare_context_c(
+        benchmark_dict=benchmark_dict,
+        cfg=cfg,
+        default_prompt=DEFAULT_PROMPT,
+        args=args,
+    )
+
+    episode_seed = int(safe_seed) + int(task_id) * 100000
+    action_a = _sample_context_action_chunk(
+        model=model,
+        processor=processor,
+        args=args,
+        current_video=model_current_video,
+        proprio=proprio,
+        context=context_a,
+        context_mask=context_mask_a,
+        action_horizon=action_horizon,
+        episode_seed=episode_seed,
+    )
+    action_b = _sample_context_action_chunk(
+        model=model,
+        processor=processor,
+        args=args,
+        current_video=model_current_video,
+        proprio=proprio,
+        context=context_b,
+        context_mask=context_mask_b,
+        action_horizon=action_horizon,
+        episode_seed=episode_seed,
+    )
+    action_c = _sample_context_action_chunk(
+        model=model,
+        processor=processor,
+        args=args,
+        current_video=model_current_video,
+        proprio=proprio,
+        context=context_c_info["context"],
+        context_mask=context_c_info["context_mask"],
+        action_horizon=action_horizon,
+        episode_seed=episode_seed,
+    )
+
+    _print_context_action_group(
+        "A",
+        description=f"{args.libero_suite} task {task_id}: {task_description}",
+        context=context_a,
+        action_chunk=action_a,
+    )
+    _print_context_action_group(
+        "B",
+        description="zero context shaped like rollout task context",
+        context=context_b,
+        action_chunk=action_b,
+    )
+    _print_context_action_group(
+        "C",
+        description=(
+            f"{context_c_info['suite']} task {context_c_info['task_id']}: "
+            f"{context_c_info['description']}"
+        ),
+        context=context_c_info["context"],
+        action_chunk=action_c,
+    )
+    _print_action_pair("A-B", action_a, action_b)
+    _print_action_pair("A-C", action_a, action_c)
+    _print_action_pair("B-C", action_b, action_c)
+
+
 def run_rollout_eval(
     *,
     cfg: DictConfig,
@@ -969,11 +1315,7 @@ def run_rollout_eval(
     from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
     from fastwam.utils.pytorch_utils import set_global_seed
 
-    safe_seed = int(args.seed)
-    if safe_seed <= 0:
-        print("WARNING --seed must be >0 for FastWAM set_global_seed; using seed=1", flush=True)
-        safe_seed = 1
-    args.effective_seed = safe_seed
+    safe_seed = _sanitize_fastwam_seed(args)
     set_global_seed(safe_seed, get_worker_init_fn=False)
     stats_path = resolve_dataset_stats_path(cfg, args)
     dataset_stats = load_dataset_stats_from_json(str(stats_path))
@@ -1010,6 +1352,11 @@ def run_rollout_eval(
         )
         prompt = DEFAULT_PROMPT.format(task=task_description)
         context, context_mask = rollout_base.load_cached_text_context(prompt, cfg)
+        if bool(args.zero_context):
+            print("WARNING --zero-context enabled; using zero text context for rollout.", flush=True)
+            context = torch.zeros_like(context)
+        if bool(args.debug_context_fingerprint):
+            _print_context_fingerprint(f"task={task_id}", task_description, context)
         task_rows: list[dict[str, Any]] = []
         print(
             f"rollout_task_id={task_id} future_source={args.future_source}", flush=True
@@ -1111,6 +1458,10 @@ def main() -> None:
         device=device,
         dtype=dtype,
     )
+
+    if bool(args.compare_context_actions):
+        run_context_action_compare(cfg=cfg, model=model, args=args)
+        return
 
     output_json = resolve_path(args.output_json)
     if output_json is None:

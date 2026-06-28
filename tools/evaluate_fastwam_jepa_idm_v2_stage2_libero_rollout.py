@@ -542,6 +542,25 @@ def _tensor_abs_mean_norm(tensor: torch.Tensor) -> tuple[float, float]:
     return float(data.abs().mean().item()), float(data.norm().item())
 
 
+def _resize_model_video(
+    video: torch.Tensor,
+    *,
+    frame_count: int,
+    size: int,
+    name: str,
+) -> torch.Tensor:
+    if video.ndim != 5:
+        raise ValueError(f"{name} must be [B, C, T, H, W], got {tuple(video.shape)}.")
+    resized = stage2_train.resize_video(video, size=int(size))
+    expected = (int(resized.shape[0]), 3, int(frame_count), int(size), int(size))
+    if tuple(resized.shape) != expected:
+        raise ValueError(
+            f"{name} model video must be [B, 3, {int(frame_count)}, {int(size)}, {int(size)}], "
+            f"got {tuple(resized.shape)}."
+        )
+    return resized
+
+
 def _array_min_max_mean(value: Any) -> tuple[float, float, float]:
     array = np.asarray(value, dtype=np.float32)
     return float(array.min()), float(array.max()), float(array.mean())
@@ -631,11 +650,19 @@ def _print_debug_step(
         flush=True,
     )
     print(
-        "DEBUG current_video "
-        f"shape={debug_stats.get('current_video_shape')} "
-        f"min={debug_stats.get('current_video_min'):.6g} "
-        f"max={debug_stats.get('current_video_max'):.6g} "
-        f"mean={debug_stats.get('current_video_mean'):.6g}",
+        "DEBUG raw_current_video "
+        f"shape={debug_stats.get('raw_current_video_shape')} "
+        f"min={debug_stats.get('raw_current_video_min'):.6g} "
+        f"max={debug_stats.get('raw_current_video_max'):.6g} "
+        f"mean={debug_stats.get('raw_current_video_mean'):.6g}",
+        flush=True,
+    )
+    print(
+        "DEBUG model_current_video "
+        f"shape={debug_stats.get('model_current_video_shape')} "
+        f"min={debug_stats.get('model_current_video_min'):.6g} "
+        f"max={debug_stats.get('model_current_video_max'):.6g} "
+        f"mean={debug_stats.get('model_current_video_mean'):.6g}",
         flush=True,
     )
     print(
@@ -697,7 +724,13 @@ def predict_env_action_chunk(
     histories = getattr(rollout_base.predict_env_action_chunk, "_frame_histories")
     frame_history: rollout_base.FrameHistory = histories[str(args.future_source)]
     frame_history.append(image)
-    current_video = frame_history.as_video()
+    raw_current_video = frame_history.as_video()
+    current_video = _resize_model_video(
+        raw_current_video,
+        frame_count=int(args.current_frame_count),
+        size=int(args.vjepa_img_size),
+        name="current_video",
+    )
 
     oracle_future_video = None
     if str(args.future_source) == "oracle":
@@ -710,6 +743,12 @@ def predict_env_action_chunk(
             input_w=input_w,
             input_h=input_h,
             model=model,
+        )
+        oracle_future_video = _resize_model_video(
+            oracle_future_video,
+            frame_count=int(args.future_frame_count),
+            size=int(args.vjepa_img_size),
+            name="oracle_future_video",
         )
 
     pred = rollout_base.sample_action_jepa_idm(
@@ -737,13 +776,18 @@ def predict_env_action_chunk(
 
     debug_stats: dict[str, Any] = {}
     if debug_requested:
+        raw_cv_min, raw_cv_max, raw_cv_mean = _array_min_max_mean(raw_current_video.detach().float().cpu().numpy())
         cv_min, cv_max, cv_mean = _array_min_max_mean(current_video.detach().float().cpu().numpy())
         act_min, act_max, act_mean = _array_min_max_mean(action)
         debug_stats = {
-            "current_video_shape": tuple(current_video.shape),
-            "current_video_min": cv_min,
-            "current_video_max": cv_max,
-            "current_video_mean": cv_mean,
+            "raw_current_video_shape": tuple(raw_current_video.shape),
+            "raw_current_video_min": raw_cv_min,
+            "raw_current_video_max": raw_cv_max,
+            "raw_current_video_mean": raw_cv_mean,
+            "model_current_video_shape": tuple(current_video.shape),
+            "model_current_video_min": cv_min,
+            "model_current_video_max": cv_max,
+            "model_current_video_mean": cv_mean,
             "proprio_shape": None if proprio is None else tuple(proprio.shape),
             "proprio_first": [] if proprio is None else proprio.detach().float().reshape(proprio.shape[0], -1)[0].cpu().numpy(),
             "action_chunk_shape": tuple(action.shape),

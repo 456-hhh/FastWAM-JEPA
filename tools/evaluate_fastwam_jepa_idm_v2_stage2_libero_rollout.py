@@ -71,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-videos", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument("--debug-first-steps", type=int, default=0)
 
     parser.add_argument("--config-name", default="train")
     parser.add_argument("--task", default="libero_idm_2cam224_1e-4")
@@ -536,6 +537,136 @@ def summarize_task(rows: list[dict[str, Any]], *, description: str) -> dict[str,
     }
 
 
+def _tensor_abs_mean_norm(tensor: torch.Tensor) -> tuple[float, float]:
+    data = tensor.detach().float()
+    return float(data.abs().mean().item()), float(data.norm().item())
+
+
+def _array_min_max_mean(value: Any) -> tuple[float, float, float]:
+    array = np.asarray(value, dtype=np.float32)
+    return float(array.min()), float(array.max()), float(array.mean())
+
+
+def _format_vector(value: Any, *, max_items: int = 16) -> str:
+    array = np.asarray(value, dtype=np.float32).reshape(-1)
+    shown = array[:max_items]
+    body = ", ".join(f"{float(item):.5g}" for item in shown)
+    if array.size > max_items:
+        body += ", ..."
+    return f"[{body}]"
+
+
+@torch.no_grad()
+def _debug_model_context_stats(
+    *,
+    model: torch.nn.Module,
+    current_video: torch.Tensor,
+    context: torch.Tensor,
+    context_mask: torch.Tensor,
+    proprio: torch.Tensor | None,
+    future_source: str,
+) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "action_context_shape": model.last_forward_shapes.get("action_context"),
+    }
+    if future_source != "predicted":
+        return stats
+    device = model._runtime_device()
+    current_video = current_video.to(device=device, dtype=model.torch_dtype)
+    context = context.to(device=device, dtype=model.torch_dtype)
+    context_mask = context_mask.to(device=device, dtype=torch.bool)
+    if context.ndim == 2:
+        context = context.unsqueeze(0)
+    if context_mask.ndim == 1:
+        context_mask = context_mask.unsqueeze(0)
+    proprio_arg = None
+    if proprio is not None:
+        proprio_arg = proprio.to(device=device, dtype=model.torch_dtype)
+    condition_context, condition_mask = model._append_proprio_to_context(
+        context=context,
+        context_mask=context_mask,
+        proprio=proprio_arg,
+    )
+    current_jepa_tokens = model._encode_jepa_video(current_video)
+    future_out = model.future_predictor(
+        current_jepa_tokens=current_jepa_tokens,
+        condition_context=condition_context,
+        condition_mask=condition_mask,
+    )
+    pred_future = future_out["pred_future_tokens"].detach().float()
+    action_context, _ = model.jepa_adapter(
+        current_jepa_tokens=current_jepa_tokens,
+        future_jepa_tokens=future_out["pred_future_tokens"],
+        base_context=condition_context,
+        base_context_mask=condition_mask,
+    )
+    stats.update(
+        {
+            "predicted_future_jepa_shape": tuple(pred_future.shape),
+            "predicted_future_jepa_mean": float(pred_future.mean().item()),
+            "predicted_future_jepa_std": float(pred_future.std(unbiased=False).item()),
+            "action_context_shape": tuple(action_context.shape),
+        }
+    )
+    return stats
+
+
+def _print_debug_step(
+    *,
+    policy_step: int,
+    task_id: int,
+    task_description: str,
+    prompt: str,
+    context: torch.Tensor,
+    debug_stats: dict[str, Any],
+    first_action: Any,
+    future_source: str,
+) -> None:
+    context_abs_mean, context_norm = _tensor_abs_mean_norm(context)
+    print(f"DEBUG policy_step={policy_step} task_id={task_id} future_source={future_source}", flush=True)
+    print(f"DEBUG task_description={task_description.replace(chr(10), ' ')}", flush=True)
+    print(f"DEBUG prompt={prompt.replace(chr(10), ' ')}", flush=True)
+    print(
+        f"DEBUG context shape={tuple(context.shape)} abs_mean={context_abs_mean:.6g} norm={context_norm:.6g}",
+        flush=True,
+    )
+    print(
+        "DEBUG current_video "
+        f"shape={debug_stats.get('current_video_shape')} "
+        f"min={debug_stats.get('current_video_min'):.6g} "
+        f"max={debug_stats.get('current_video_max'):.6g} "
+        f"mean={debug_stats.get('current_video_mean'):.6g}",
+        flush=True,
+    )
+    print(
+        "DEBUG proprio "
+        f"shape={debug_stats.get('proprio_shape')} "
+        f"first={_format_vector(debug_stats.get('proprio_first', []))}",
+        flush=True,
+    )
+    print(
+        "DEBUG action_chunk "
+        f"shape={debug_stats.get('action_chunk_shape')} "
+        f"min={debug_stats.get('action_chunk_min'):.6g} "
+        f"max={debug_stats.get('action_chunk_max'):.6g} "
+        f"mean={debug_stats.get('action_chunk_mean'):.6g}",
+        flush=True,
+    )
+    print(f"DEBUG first_env_action={_format_vector(first_action)}", flush=True)
+    if future_source == "predicted" and "predicted_future_jepa_shape" in debug_stats:
+        print(
+            "DEBUG predicted_future_jepa "
+            f"shape={debug_stats.get('predicted_future_jepa_shape')} "
+            f"mean={debug_stats.get('predicted_future_jepa_mean'):.6g} "
+            f"std={debug_stats.get('predicted_future_jepa_std'):.6g}",
+            flush=True,
+        )
+    elif future_source == "predicted" and "predicted_future_jepa_error" in debug_stats:
+        print(f"DEBUG predicted_future_jepa_error={debug_stats['predicted_future_jepa_error']}", flush=True)
+    else:
+        print("DEBUG predicted_future_jepa=not_applicable", flush=True)
+    print(f"DEBUG action_context shape={debug_stats.get('action_context_shape')}", flush=True)
+
 def predict_env_action_chunk(
     *,
     env,
@@ -550,29 +681,98 @@ def predict_env_action_chunk(
     input_w: int,
     input_h: int,
     episode_seed: int,
-) -> tuple[np.ndarray, dict]:
-    return rollout_base.predict_env_action_chunk(
-        env=env,
-        obs=obs,
-        model=model,
-        processor=processor,
+    debug_requested: bool = False,
+) -> tuple[np.ndarray, dict, dict[str, Any]]:
+    image, proprio, imgs = rollout_base._obs_to_model_input(
+        obs,
         cfg=cfg,
-        args=args,
+        processor=processor,
+        width=input_w,
+        height=input_h,
+        device=model._runtime_device(),
+        dtype=model.torch_dtype,
+    )
+    if not hasattr(rollout_base.predict_env_action_chunk, "_frame_histories"):
+        raise RuntimeError("Frame history storage was not initialized.")
+    histories = getattr(rollout_base.predict_env_action_chunk, "_frame_histories")
+    frame_history: rollout_base.FrameHistory = histories[str(args.future_source)]
+    frame_history.append(image)
+    current_video = frame_history.as_video()
+
+    oracle_future_video = None
+    if str(args.future_source) == "oracle":
+        oracle_future_video = rollout_base.collect_oracle_future_video(
+            env=env,
+            obs=obs,
+            cfg=cfg,
+            processor=processor,
+            args=args,
+            input_w=input_w,
+            input_h=input_h,
+            model=model,
+        )
+
+    pred = rollout_base.sample_action_jepa_idm(
+        model=model,
+        current_video=current_video,
         context=context,
         context_mask=context_mask,
+        proprio=proprio,
         action_horizon=action_horizon,
-        input_w=input_w,
-        input_h=input_h,
-        episode_seed=episode_seed,
-        mode=str(args.future_source),
+        future_source=str(args.future_source),
+        oracle_future_video=oracle_future_video,
+        num_inference_steps=int(args.num_inference_steps),
+        sigma_shift=args.sigma_shift,
+        seed=episode_seed,
+        rand_device=str(args.rand_device),
     )
+    action = rollout_base._denormalize_action(pred["action"], processor)[0]
+    action[..., -1] = action[..., -1] * 2 - 1
 
+    from experiments.libero.libero_utils import invert_gripper_action
+
+    action = invert_gripper_action(action)
+    if bool(args.binarize_gripper):
+        action[..., -1] = np.sign(action[..., -1])
+
+    debug_stats: dict[str, Any] = {}
+    if debug_requested:
+        cv_min, cv_max, cv_mean = _array_min_max_mean(current_video.detach().float().cpu().numpy())
+        act_min, act_max, act_mean = _array_min_max_mean(action)
+        debug_stats = {
+            "current_video_shape": tuple(current_video.shape),
+            "current_video_min": cv_min,
+            "current_video_max": cv_max,
+            "current_video_mean": cv_mean,
+            "proprio_shape": None if proprio is None else tuple(proprio.shape),
+            "proprio_first": [] if proprio is None else proprio.detach().float().reshape(proprio.shape[0], -1)[0].cpu().numpy(),
+            "action_chunk_shape": tuple(action.shape),
+            "action_chunk_min": act_min,
+            "action_chunk_max": act_max,
+            "action_chunk_mean": act_mean,
+            "action_context_shape": model.last_forward_shapes.get("action_context"),
+        }
+        try:
+            debug_stats.update(
+                _debug_model_context_stats(
+                    model=model,
+                    current_video=current_video,
+                    context=context,
+                    context_mask=context_mask,
+                    proprio=proprio,
+                    future_source=str(args.future_source),
+                )
+            )
+        except Exception as exc:
+            debug_stats["predicted_future_jepa_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+    return action, imgs, debug_stats
 
 def run_rollout_episode(
     *,
     env,
     initial_state,
     task_description: str,
+    prompt: str,
     model: torch.nn.Module,
     processor,
     cfg: DictConfig,
@@ -619,7 +819,10 @@ def run_rollout_episode(
             action_to_env = get_libero_dummy_action()
         else:
             if not pending_actions:
-                action, imgs = predict_env_action_chunk(
+                debug_limit = int(args.debug_first_steps)
+                debug_step = int(getattr(args, "_debug_steps_printed", 0))
+                debug_requested = debug_limit > 0 and debug_step < debug_limit
+                action, imgs, debug_stats = predict_env_action_chunk(
                     env=env,
                     obs=obs,
                     model=model,
@@ -634,6 +837,7 @@ def run_rollout_episode(
                     episode_seed=int(args.effective_seed)
                     + int(task_id) * 100_000
                     + int(episode_idx),
+                    debug_requested=debug_requested,
                 )
                 if bool(args.save_videos):
                     try:
@@ -641,6 +845,18 @@ def run_rollout_episode(
                     except Exception as exc:
                         _warn_video_issue("failed to capture rollout frame", exc)
                 pending_actions = action[: int(args.exec_horizon)].tolist()
+                if debug_requested and pending_actions:
+                    _print_debug_step(
+                        policy_step=debug_step,
+                        task_id=int(task_id),
+                        task_description=task_description,
+                        prompt=prompt,
+                        context=context,
+                        debug_stats=debug_stats,
+                        first_action=pending_actions[0],
+                        future_source=str(args.future_source),
+                    )
+                    args._debug_steps_printed = debug_step + 1
             action_to_env = pending_actions.pop(0)
 
         obs, reward, done, _ = env.step(action_to_env)
@@ -760,6 +976,7 @@ def run_rollout_eval(
                     env=env,
                     initial_state=initial_states[episode_idx],
                     task_description=task_description,
+                    prompt=prompt,
                     model=model,
                     processor=processor,
                     cfg=cfg,

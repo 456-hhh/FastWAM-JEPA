@@ -63,6 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--future-predictor-hidden-dim", type=int, default=1024)
     parser.add_argument("--future-predictor-heads", type=int, default=16)
     parser.add_argument("--precision", default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--lambda-future", type=float, default=0.05)
+    parser.add_argument("--lambda-cos", type=float, default=0.1)
     parser.add_argument("--exec-horizon", type=int, default=1)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output-json", required=True)

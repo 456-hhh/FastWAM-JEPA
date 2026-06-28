@@ -488,6 +488,39 @@ def _mean(values: list[float]) -> float:
     return float(np.mean(values)) if values else 0.0
 
 
+def _frame_to_rgb(frame: Any) -> np.ndarray:
+    if isinstance(frame, dict):
+        for key in ("image", "agentview_image", "wrist_image"):
+            if key in frame:
+                frame = frame[key]
+                break
+        else:
+            raise ValueError(
+                "Video frame dict must contain image, agentview_image, or wrist_image."
+            )
+    array = np.asarray(frame)
+    if array.ndim == 2:
+        array = np.repeat(array[..., None], 3, axis=2)
+    elif array.ndim == 3 and array.shape[0] == 3 and array.shape[-1] != 3:
+        array = np.transpose(array, (1, 2, 0))
+    if array.ndim != 3:
+        raise ValueError(f"Video frame must be HWC RGB-like, got shape {array.shape}.")
+    if array.shape[-1] > 3:
+        array = array[..., :3]
+    if array.shape[-1] != 3:
+        raise ValueError(f"Video frame must have 3 channels, got shape {array.shape}.")
+    if array.dtype != np.uint8:
+        if np.issubdtype(array.dtype, np.floating) and array.size and array.max() <= 1.0:
+            array = array * 255.0
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(array)
+
+
+def _warn_video_issue(prefix: str, exc: Exception) -> None:
+    message = str(exc).replace("\n", " ")[:300]
+    print(f"WARNING {prefix}: {type(exc).__name__}: {message}", flush=True)
+
+
 def summarize_task(rows: list[dict[str, Any]], *, description: str) -> dict[str, Any]:
     successes = sum(1 for row in rows if bool(row["success"]))
     returns = [float(row["return"]) for row in rows]
@@ -603,7 +636,10 @@ def run_rollout_episode(
                     + int(episode_idx),
                 )
                 if bool(args.save_videos):
-                    replay_images.append(imgs.copy())
+                    try:
+                        replay_images.append(_frame_to_rgb(imgs))
+                    except Exception as exc:
+                        _warn_video_issue("failed to capture rollout frame", exc)
                 pending_actions = action[: int(args.exec_horizon)].tolist()
             action_to_env = pending_actions.pop(0)
 
@@ -613,7 +649,10 @@ def run_rollout_episode(
             and step_idx >= int(args.num_steps_wait)
             and pending_actions
         ):
-            replay_images.append(get_libero_image(obs))
+            try:
+                replay_images.append(_frame_to_rgb(get_libero_image(obs)))
+            except Exception as exc:
+                _warn_video_issue("failed to capture rollout frame", exc)
         episode_return += float(np.asarray(reward).reshape(-1)[0])
         length += 1
         if done:
@@ -626,13 +665,22 @@ def run_rollout_episode(
                 "--save-videos was enabled but no video_dir was provided."
             )
         video_dir.mkdir(parents=True, exist_ok=True)
-        video_path = save_rollout_video(
-            replay_images,
-            video_dir,
-            f"{args.future_source}_task{task_id}_episode{episode_idx}",
-            success=success,
-            task_description=task_description,
-        )
+        if replay_images:
+            try:
+                video_path = save_rollout_video(
+                    video_dir,
+                    replay_images,
+                    f"{args.future_source}_task{task_id}_episode{episode_idx}",
+                    success=success,
+                    task_description=task_description,
+                    fps=20,
+                )
+            except Exception as exc:
+                _warn_video_issue("failed to save rollout video", exc)
+                video_path = None
+        else:
+            print("WARNING no rollout frames captured; skipping video save", flush=True)
+
 
     return {
         "future_source": str(args.future_source),

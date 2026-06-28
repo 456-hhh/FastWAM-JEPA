@@ -598,7 +598,7 @@ def run_rollout_episode(
                     action_horizon=action_horizon,
                     input_w=input_w,
                     input_h=input_h,
-                    episode_seed=int(args.seed)
+                    episode_seed=int(args.effective_seed)
                     + int(task_id) * 100_000
                     + int(episode_idx),
                 )
@@ -661,7 +661,12 @@ def run_rollout_eval(
     from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
     from fastwam.utils.pytorch_utils import set_global_seed
 
-    set_global_seed(int(args.seed), get_worker_init_fn=False)
+    safe_seed = int(args.seed)
+    if safe_seed <= 0:
+        print("WARNING --seed must be >0 for FastWAM set_global_seed; using seed=1", flush=True)
+        safe_seed = 1
+    args.effective_seed = safe_seed
+    set_global_seed(safe_seed, get_worker_init_fn=False)
     stats_path = resolve_dataset_stats_path(cfg, args)
     dataset_stats = load_dataset_stats_from_json(str(stats_path))
     processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
@@ -693,7 +698,7 @@ def run_rollout_eval(
                 initial_states[: int(args.num_episodes) - len(initial_states)]
             )
         env, task_description = get_libero_env(
-            task, LIBERO_ENV_RESOLUTION, int(args.seed)
+            task, LIBERO_ENV_RESOLUTION, safe_seed
         )
         prompt = DEFAULT_PROMPT.format(task=task_description)
         context, context_mask = rollout_base.load_cached_text_context(prompt, cfg)
@@ -745,6 +750,7 @@ def run_rollout_eval(
         "libero_suite": str(args.libero_suite),
         "num_episodes": int(args.num_episodes),
         "seed": int(args.seed),
+        "effective_seed": int(args.effective_seed),
         "overall_success_rate": float(success_count / max(total, 1)),
         "per_task": per_task,
         "avg_episode_length": _mean(lengths),

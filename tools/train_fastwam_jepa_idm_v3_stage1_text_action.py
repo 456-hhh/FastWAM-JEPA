@@ -167,6 +167,7 @@ def save_checkpoint(
     output_dir: Path,
     step: int,
     args: argparse.Namespace,
+    world_size: int,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     module = stage2_libero.unwrap_ddp(model)
@@ -181,6 +182,7 @@ def save_checkpoint(
             "optimizer": optimizer.state_dict(),
             "step": int(step),
             "args": vars(args),
+            "world_size": int(world_size),
         },
         path,
     )
@@ -236,8 +238,13 @@ def main() -> None:
     stage2_libero.rank0_print(rank, f"world_size={world_size}", flush=True)
     stage2_libero.rank0_print(rank, f"rank={rank}", flush=True)
     stage2_libero.rank0_print(rank, f"local_rank={local_rank}", flush=True)
-    stage2_libero.rank0_print(rank, f"batch_size={args.batch_size}", flush=True)
+    stage2_libero.rank0_print(rank, f"local_batch_size_per_gpu={args.batch_size}", flush=True)
     stage2_libero.rank0_print(rank, f"grad_accum_steps={args.grad_accum_steps}", flush=True)
+    stage2_libero.rank0_print(
+        rank,
+        f"effective_global_batch_size={int(args.batch_size) * int(world_size) * int(args.grad_accum_steps)}",
+        flush=True,
+    )
 
     optimizer.zero_grad(set_to_none=True)
     update_step = 0
@@ -312,6 +319,7 @@ def main() -> None:
                 output_dir=checkpoint_dir,
                 step=update_step,
                 args=args,
+                world_size=world_size,
             )
             print(f"saved_checkpoint={path}", flush=True)
 
@@ -322,6 +330,7 @@ def main() -> None:
             output_dir=checkpoint_dir,
             step=update_step,
             args=args,
+            world_size=world_size,
         )
         print(
             " ".join(

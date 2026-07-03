@@ -207,6 +207,100 @@ class ActionEncoder(nn.Module):
         return self.output_norm(self.output_proj(x))
 
 
+class VisionProjector(nn.Module):
+    def __init__(
+        self,
+        *,
+        input_dim: int = 1408,
+        token_count: int = 512,
+        latent_dim: int = 1024,
+        num_queries: int = 4,
+        num_heads: int = 8,
+        num_layers: int = 3,
+    ) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.token_count = int(token_count)
+        self.latent_dim = int(latent_dim)
+        self.num_queries = int(num_queries)
+        self.input_norm = nn.LayerNorm(self.input_dim)
+        self.input_proj = nn.Linear(self.input_dim, self.latent_dim)
+        self.pool = LearnedQueryCrossAttentionPool(
+            num_queries=self.num_queries,
+            dim=self.latent_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+        )
+
+    def forward(
+        self,
+        current_jepa_tokens: torch.Tensor,
+        *,
+        token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            current_jepa_tokens.ndim != 3
+            or int(current_jepa_tokens.shape[1]) != self.token_count
+            or int(current_jepa_tokens.shape[2]) != self.input_dim
+        ):
+            raise ValueError(
+                f"current_jepa_tokens must be [B, {self.token_count}, {self.input_dim}], "
+                f"got {tuple(current_jepa_tokens.shape)}."
+            )
+        x = self.input_proj(self.input_norm(current_jepa_tokens))
+        return self.pool(x, context_mask=token_mask)
+
+
+class FusionVL(nn.Module):
+    def __init__(
+        self,
+        *,
+        latent_dim: int = 1024,
+        num_tokens: int = 4,
+        num_layers: int = 3,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+    ) -> None:
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.num_tokens = int(num_tokens)
+        self.emb_v = nn.Parameter(torch.zeros(1, 1, self.latent_dim))
+        self.emb_l = nn.Parameter(torch.zeros(1, 1, self.latent_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.latent_dim,
+            nhead=num_heads,
+            dim_feedforward=int(self.latent_dim * mlp_ratio),
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            norm=nn.LayerNorm(self.latent_dim),
+        )
+        self.action_pool = LearnedQueryCrossAttentionPool(
+            num_queries=self.num_tokens,
+            dim=self.latent_dim,
+            num_heads=num_heads,
+            num_layers=1,
+        )
+        self.output_norm = nn.LayerNorm(self.latent_dim)
+
+    def forward(self, z_v: torch.Tensor, z_l: torch.Tensor) -> torch.Tensor:
+        expected_tail = (self.num_tokens, self.latent_dim)
+        if z_v.ndim != 3 or tuple(z_v.shape[1:]) != expected_tail:
+            raise ValueError(f"z_v must be [B, {self.num_tokens}, {self.latent_dim}], got {tuple(z_v.shape)}.")
+        if z_l.ndim != 3 or tuple(z_l.shape[1:]) != expected_tail:
+            raise ValueError(f"z_l must be [B, {self.num_tokens}, {self.latent_dim}], got {tuple(z_l.shape)}.")
+        if int(z_v.shape[0]) != int(z_l.shape[0]):
+            raise ValueError(f"z_v and z_l batch sizes must match, got {z_v.shape[0]} vs {z_l.shape[0]}.")
+        fused = torch.cat([z_v + self.emb_v, z_l + self.emb_l], dim=1)
+        fused = self.transformer(fused)
+        return self.output_norm(self.action_pool(fused))
+
+
 class TextToActionHead(nn.Module):
     def __init__(
         self,
@@ -301,9 +395,11 @@ def latent_norms(**latents: torch.Tensor) -> dict[str, float]:
 
 __all__ = [
     "ActionEncoder",
+    "FusionVL",
     "LanguageProjector",
     "LearnedQueryCrossAttentionPool",
     "TextToActionHead",
+    "VisionProjector",
     "contrastive_loss",
     "latent_norms",
     "retrieval_accuracy",

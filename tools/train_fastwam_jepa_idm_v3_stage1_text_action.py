@@ -81,6 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--context-tokens", type=int, default=128)
     parser.add_argument("--action-horizon", type=int, default=32)
     parser.add_argument("--ddp-find-unused-parameters", action=argparse.BooleanOptionalAction, default=False)
@@ -160,6 +161,43 @@ def reduce_metrics(
     return reduced
 
 
+def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device)
+
+
+def load_resume_checkpoint(
+    *,
+    model: Stage1TextActionModel,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_path: str | Path,
+    device: torch.device,
+) -> int:
+    path = resolve_path(checkpoint_path)
+    if path is None or not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"--resume-checkpoint does not exist or is not a file: {path}")
+    checkpoint = torch.load(str(path), map_location=device)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Resume checkpoint must be a dict, got {type(checkpoint)}.")
+    for key, module in (
+        ("language_projector", model.language_projector),
+        ("action_encoder", model.action_encoder),
+        ("text_to_action_head", model.text_to_action_head),
+    ):
+        state = checkpoint.get(key)
+        if not isinstance(state, dict):
+            raise ValueError(f"Resume checkpoint missing {key} state_dict.")
+        module.load_state_dict(state, strict=True)
+    optimizer_state = checkpoint.get("optimizer")
+    if not isinstance(optimizer_state, dict):
+        raise ValueError("Resume checkpoint missing optimizer state_dict.")
+    optimizer.load_state_dict(optimizer_state)
+    _move_optimizer_state_to_device(optimizer, device)
+    if "step" not in checkpoint:
+        raise ValueError("Resume checkpoint missing step.")
+    return int(checkpoint["step"])
 def save_checkpoint(
     *,
     model: nn.Module,
@@ -221,6 +259,30 @@ def main() -> None:
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
     )
+    start_step = 0
+    if args.resume_checkpoint is not None:
+        start_step = load_resume_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            checkpoint_path=args.resume_checkpoint,
+            device=device,
+        )
+        target_steps = int(args.steps)
+        remaining_steps = max(target_steps - int(start_step), 0)
+        stage2_libero.rank0_print(rank, f"resume_checkpoint={resolve_path(args.resume_checkpoint)}", flush=True)
+        stage2_libero.rank0_print(rank, f"resumed_from_step={start_step}", flush=True)
+        stage2_libero.rank0_print(rank, f"target_steps={target_steps}", flush=True)
+        stage2_libero.rank0_print(rank, f"remaining_steps={remaining_steps}", flush=True)
+    if int(args.steps) <= int(start_step):
+        stage2_libero.rank0_print(
+            rank,
+            f"target_steps={int(args.steps)} already reached by start_step={int(start_step)}; exiting without training.",
+            flush=True,
+        )
+        if ddp_enabled:
+            dist.barrier()
+            dist.destroy_process_group()
+        return
     if ddp_enabled:
         model = DDP(
             model,
@@ -247,8 +309,8 @@ def main() -> None:
     )
 
     optimizer.zero_grad(set_to_none=True)
-    update_step = 0
-    micro_step = 0
+    update_step = int(start_step)
+    micro_step = int(start_step) * int(args.grad_accum_steps)
     last_metrics: dict[str, float] = {}
     start_time = time.time()
     accum_start = time.time()

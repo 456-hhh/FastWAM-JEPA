@@ -301,6 +301,67 @@ class FusionVL(nn.Module):
         return self.output_norm(self.action_pool(fused))
 
 
+class ProprioProjector(nn.Module):
+    def __init__(
+        self,
+        *,
+        proprio_dim: int = 8,
+        hidden_dim: int = 256,
+        latent_dim: int = 1024,
+    ) -> None:
+        super().__init__()
+        self.proprio_dim = int(proprio_dim)
+        self.latent_dim = int(latent_dim)
+        self.net = nn.Sequential(
+            nn.Linear(self.proprio_dim, int(hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(hidden_dim), self.latent_dim),
+            nn.LayerNorm(self.latent_dim),
+        )
+
+    def forward(self, proprio: torch.Tensor) -> torch.Tensor:
+        if proprio.ndim != 2 or int(proprio.shape[1]) != self.proprio_dim:
+            raise ValueError(f"proprio must be [B, {self.proprio_dim}], got {tuple(proprio.shape)}.")
+        return self.net(proprio).unsqueeze(1)
+
+
+class FusionVLP(nn.Module):
+    def __init__(
+        self,
+        *,
+        latent_dim: int = 1024,
+        num_tokens: int = 4,
+        num_heads: int = 8,
+        num_layers: int = 3,
+    ) -> None:
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.num_tokens = int(num_tokens)
+        self.emb_v = nn.Parameter(torch.zeros(1, 1, self.latent_dim))
+        self.emb_l = nn.Parameter(torch.zeros(1, 1, self.latent_dim))
+        self.emb_p = nn.Parameter(torch.zeros(1, 1, self.latent_dim))
+        self.task_pool = LearnedQueryCrossAttentionPool(
+            num_queries=self.num_tokens,
+            dim=self.latent_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+        )
+        self.output_norm = nn.LayerNorm(self.latent_dim)
+
+    def forward(self, z_v: torch.Tensor, z_l: torch.Tensor, z_p: torch.Tensor) -> torch.Tensor:
+        expected_tail = (self.num_tokens, self.latent_dim)
+        if z_v.ndim != 3 or tuple(z_v.shape[1:]) != expected_tail:
+            raise ValueError(f"z_v must be [B, {self.num_tokens}, {self.latent_dim}], got {tuple(z_v.shape)}.")
+        if z_l.ndim != 3 or tuple(z_l.shape[1:]) != expected_tail:
+            raise ValueError(f"z_l must be [B, {self.num_tokens}, {self.latent_dim}], got {tuple(z_l.shape)}.")
+        if z_p.ndim != 3 or tuple(z_p.shape[1:]) != (1, self.latent_dim):
+            raise ValueError(f"z_p must be [B, 1, {self.latent_dim}], got {tuple(z_p.shape)}.")
+        if int(z_v.shape[0]) != int(z_l.shape[0]) or int(z_v.shape[0]) != int(z_p.shape[0]):
+            raise ValueError(f"z_v/z_l/z_p batch sizes must match, got {z_v.shape[0]}, {z_l.shape[0]}, {z_p.shape[0]}.")
+        fused = torch.cat([z_v + self.emb_v, z_l + self.emb_l, z_p + self.emb_p], dim=1)
+        return self.output_norm(self.task_pool(fused))
+
+
 class TextToActionHead(nn.Module):
     def __init__(
         self,
@@ -396,8 +457,10 @@ def latent_norms(**latents: torch.Tensor) -> dict[str, float]:
 __all__ = [
     "ActionEncoder",
     "FusionVL",
+    "FusionVLP",
     "LanguageProjector",
     "LearnedQueryCrossAttentionPool",
+    "ProprioProjector",
     "TextToActionHead",
     "VisionProjector",
     "contrastive_loss",

@@ -11,96 +11,73 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from fastwam.models.wan22.pairwise_stage4 import Stage4VLPVAActionModel
+
+
+def _assert_module_has_grad(module: torch.nn.Module, *, name: str) -> None:
+    trainable = [parameter for parameter in module.parameters() if parameter.requires_grad]
+    if not trainable:
+        raise AssertionError(f"{name} has no trainable parameters.")
+    if not any(parameter.grad is not None for parameter in trainable):
+        raise AssertionError(f"{name} received no gradients.")
+
 
 def main() -> None:
-    from fastwam.models.wan22.pairwise_stage4 import PairwiseStage4Model
-
-    torch.manual_seed(0)
-
+    torch.manual_seed(7)
     batch_size = 2
-    world_tokens = torch.randn(batch_size, 512, 1408)
-    text_tokens = torch.randn(batch_size, 128, 4096)
-    text_mask = torch.ones(batch_size, 128, dtype=torch.bool)
+    raw_jepa_tokens = torch.randn(batch_size, 512, 1408)
+    context = torch.randn(batch_size, 128, 4096)
+    context_mask = torch.ones(batch_size, 128, dtype=torch.bool)
+    context_mask[1, 100:] = False
     proprio = torch.randn(batch_size, 8)
-    proprio_tokens = torch.randn(batch_size, 4, 1024)
-    action_chunk = torch.randn(batch_size, 32, 7)
+    action = torch.randn(batch_size, 32, 7)
 
-    model = PairwiseStage4Model()
-
-    train_out = model.forward_train(
-        world_tokens=world_tokens,
-        text_tokens=text_tokens,
-        action_chunk=action_chunk,
-        text_mask=text_mask,
+    model = Stage4VLPVAActionModel()
+    out = model(
+        current_jepa_tokens=raw_jepa_tokens,
+        context=context,
+        context_mask=context_mask,
         proprio=proprio,
+        action=action,
+        tau=0.07,
     )
-    required_train_keys = (
-        "z_v",
-        "z_l",
-        "z_p",
-        "z_a",
-        "q_a_vlp",
-        "q_l_va",
-        "z_task",
-        "z_task_token",
-        "loss_vlp_to_a",
-        "loss_va_to_l",
-        "retrieval_acc_vlp_to_a",
-        "retrieval_acc_va_to_l",
-    )
-    for key in required_train_keys:
-        assert key in train_out, f"Missing train key: {key}"
-    assert tuple(train_out["z_task"].shape) == (batch_size, 1024)
-    assert tuple(train_out["z_task_token"].shape) == (batch_size, 4, 1024)
-    assert train_out["loss_vlp_to_a"].ndim == 0
-    assert train_out["loss_va_to_l"].ndim == 0
-    assert torch.isfinite(train_out["loss_vlp_to_a"]).item()
-    assert torch.isfinite(train_out["loss_va_to_l"]).item()
 
-    infer_out = model.forward_infer(
-        world_tokens=world_tokens,
-        text_tokens=text_tokens,
-        text_mask=text_mask,
-        proprio=proprio,
-    )
-    required_infer_keys = (
-        "z_v",
-        "z_l",
-        "z_p",
-        "q_a_vlp",
-        "z_task",
-        "z_task_token",
-    )
-    for key in required_infer_keys:
-        assert key in infer_out, f"Missing infer key: {key}"
-    assert tuple(infer_out["z_task"].shape) == (batch_size, 1024)
-    assert tuple(infer_out["z_task_token"].shape) == (batch_size, 4, 1024)
+    expected_shapes = {
+        "z_v": (batch_size, 4, 1024),
+        "z_l": (batch_size, 4, 1024),
+        "z_p": (batch_size, 1, 1024),
+        "z_task": (batch_size, 4, 1024),
+        "z_a": (batch_size, 4, 1024),
+        "q_l": (batch_size, 4, 1024),
+    }
+    for name, expected in expected_shapes.items():
+        actual = tuple(out[name].shape)
+        if actual != expected:
+            raise AssertionError(f"{name} shape must be {expected}, got {actual}.")
 
-    train_out_with_tokens = model.forward_train(
-        world_tokens=world_tokens,
-        text_tokens=text_tokens,
-        action_chunk=action_chunk,
-        text_mask=text_mask,
-        proprio_tokens=proprio_tokens,
-    )
-    assert tuple(train_out_with_tokens["z_p"].shape) == (batch_size, 4, 1024)
+    loss_vlp_a = out["loss_vlp_a"]
+    loss_va_l = out["loss_va_l"]
+    loss_total = loss_vlp_a + 0.1 * loss_va_l
+    for name, value in (
+        ("loss_vlp_a", loss_vlp_a),
+        ("loss_va_l", loss_va_l),
+        ("loss_total", loss_total),
+    ):
+        if value.ndim != 0 or not torch.isfinite(value).item():
+            raise AssertionError(f"{name} must be a finite scalar.")
 
-    total_loss = train_out["loss_vlp_to_a"] + train_out["loss_va_to_l"]
-    total_loss.backward()
-    grad_count = sum(
-        1 for param in model.parameters() if param.requires_grad and param.grad is not None
-    )
-    assert grad_count > 0
+    loss_total.backward()
+    for name in (
+        "language_projector",
+        "vision_projector",
+        "action_encoder",
+        "proprio_projector",
+        "fusion_vlp",
+        "fusion_va",
+    ):
+        _assert_module_has_grad(getattr(model, name), name=name)
 
-    print(
-        "sanity_fastwam_jepa_idm_v3_stage4 passed "
-        f"z_v={tuple(train_out['z_v'].shape)} "
-        f"z_l={tuple(train_out['z_l'].shape)} "
-        f"z_p={tuple(train_out['z_p'].shape)} "
-        f"z_a={tuple(train_out['z_a'].shape)} "
-        f"z_task={tuple(train_out['z_task'].shape)} "
-        f"z_task_token={tuple(train_out['z_task_token'].shape)}"
-    )
+    print("PASS")
 
 
 if __name__ == "__main__":

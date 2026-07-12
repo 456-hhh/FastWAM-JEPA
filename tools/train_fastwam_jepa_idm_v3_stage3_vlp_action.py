@@ -74,7 +74,8 @@ class Stage3VLPActionModel(nn.Module):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FastWAM-JEPA-IDM v3 Stage3 raw V-JEPA vision-language-proprio to action latent training.")
-    parser.add_argument("--stage2-checkpoint", required=True)
+    parser.add_argument("--stage2-checkpoint", default=None)
+    parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--config-name", default="train")
     parser.add_argument("--libero-data-root", default=None)
     parser.add_argument("--task", default="libero_idm_2cam224_1e-4")
@@ -263,6 +264,66 @@ def load_stage2_checkpoint(model: Stage3VLPActionModel, checkpoint_path: str | P
     return stats
 
 
+def load_stage3_checkpoint(
+    model: Stage3VLPActionModel,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_path: str | Path,
+    *,
+    rank: int,
+    expected_world_size: int,
+) -> int:
+    path = stage2_libero.require_file(checkpoint_path, name="--resume-checkpoint")
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Stage3 checkpoint payload must be dict, got {type(payload)}.")
+    if payload.get("stage") != "stage3_vlp_action":
+        raise ValueError(f"Stage3 checkpoint must have stage='stage3_vlp_action', got {payload.get('stage')!r}.")
+
+    for key, module in (
+        ("language_projector", model.language_projector),
+        ("action_encoder", model.action_encoder),
+        ("vision_projector", model.vision_projector),
+        ("proprio_projector", model.proprio_projector),
+        ("fusion_vlp", model.fusion_vlp),
+    ):
+        state = payload.get(key)
+        if not isinstance(state, dict):
+            raise ValueError(f"Stage3 checkpoint missing {key} state_dict.")
+        module.load_state_dict(state, strict=True)
+
+    optimizer_state = payload.get("optimizer")
+    if not isinstance(optimizer_state, dict):
+        raise ValueError("Stage3 checkpoint missing optimizer state_dict.")
+    optimizer.load_state_dict(optimizer_state)
+    if "step" not in payload:
+        raise ValueError("Stage3 checkpoint missing step.")
+    checkpoint_step = int(payload["step"])
+    if checkpoint_step < 0:
+        raise ValueError(f"Stage3 checkpoint step must be >= 0, got {checkpoint_step}.")
+
+    checkpoint_world_size = payload.get("world_size")
+    if checkpoint_world_size is not None and int(checkpoint_world_size) != int(expected_world_size):
+        stage2_libero.rank0_print(
+            rank,
+            (
+                "warning=stage3_checkpoint_world_size_mismatch "
+                f"checkpoint_world_size={int(checkpoint_world_size)} "
+                f"expected_world_size={int(expected_world_size)}"
+            ),
+            flush=True,
+        )
+    stage2_libero.rank0_print(rank, f"resumed_stage3_checkpoint={path}", flush=True)
+    stage2_libero.rank0_print(rank, f"resume_step={checkpoint_step}", flush=True)
+    return checkpoint_step
+
+
+def move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, *, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device)
+
+
 def reduce_metrics(metrics: dict[str, torch.Tensor], *, ddp_enabled: bool, world_size: int) -> dict[str, float]:
     reduced: dict[str, float] = {}
     for name, value in metrics.items():
@@ -309,6 +370,11 @@ def save_checkpoint(
 
 def main() -> None:
     args = parse_args()
+    if (args.stage2_checkpoint is None) == (args.resume_checkpoint is None):
+        raise ValueError(
+            "Exactly one of --stage2-checkpoint or "
+            "--resume-checkpoint must be provided."
+        )
     if int(args.context_tokens) != 128:
         raise ValueError("--context-tokens must remain 128 for LanguageProjector.")
     if int(args.action_horizon) != 32:
@@ -341,11 +407,27 @@ def main() -> None:
     data_iter = iter(loader)
 
     model = Stage3VLPActionModel(raw_vjepa_tokens=int(args.raw_vjepa_tokens), vjepa_dim=int(args.vjepa_dim))
-    load_stage2_checkpoint(model, args.stage2_checkpoint, rank=rank)
+    if args.stage2_checkpoint is not None:
+        load_stage2_checkpoint(model, args.stage2_checkpoint, rank=rank)
     model = model.to(device=device, dtype=param_dtype)
     vjepa_encoder = build_frozen_vjepa_encoder(args, device=device, dtype=param_dtype, rank=rank)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    resume_step = 0
+    if args.resume_checkpoint is not None:
+        resume_step = load_stage3_checkpoint(
+            model,
+            optimizer,
+            args.resume_checkpoint,
+            rank=rank,
+            expected_world_size=world_size,
+        )
+        move_optimizer_state_to_device(optimizer, device=device)
+    if int(resume_step) >= int(args.steps):
+        raise ValueError(
+            f"Resume checkpoint step {int(resume_step)} has already reached or exceeded "
+            f"target --steps {int(args.steps)}."
+        )
     if ddp_enabled:
         model = DDP(
             model,
@@ -374,8 +456,10 @@ def main() -> None:
     stage2_libero.rank0_print(rank, "stage=stage3_vlp_action", flush=True)
 
     optimizer.zero_grad(set_to_none=True)
-    update_step = 0
-    micro_step = 0
+    update_step = int(resume_step)
+    micro_step = int(resume_step) * int(args.grad_accum_steps)
+    stage2_libero.rank0_print(rank, f"initial_update_step={update_step}", flush=True)
+    stage2_libero.rank0_print(rank, f"target_update_steps={int(args.steps)}", flush=True)
     last_metrics: dict[str, float] = {}
     start_time = time.time()
     accum_start = time.time()

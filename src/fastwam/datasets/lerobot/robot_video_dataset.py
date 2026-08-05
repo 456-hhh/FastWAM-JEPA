@@ -42,6 +42,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        preserve_context_mask: bool = False,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -72,6 +73,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.preserve_context_mask = bool(preserve_context_mask)
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -218,7 +220,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         context, context_mask = self._get_cached_text_context(instruction)
         # NOTE: to keep consistent with wan2.2's behavior
         context[~context_mask] = 0.0
-        context_mask = torch.ones_like(context_mask)
+        if not self.preserve_context_mask:
+            context_mask = torch.ones_like(context_mask)
         
         data = {
             "video": video,

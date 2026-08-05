@@ -16,11 +16,18 @@ class MoT(nn.Module):
         self,
         mixtures: Dict[str, nn.Module],
         mot_checkpoint_mixed_attn: bool = True,
+        external_video_cache_only: bool = False,
     ):
         super().__init__()
         if not mixtures:
             raise ValueError("`mixtures` cannot be empty.")
-        if "video" not in mixtures or "action" not in mixtures:
+        self.external_video_cache_only = bool(external_video_cache_only)
+        if self.external_video_cache_only:
+            if set(mixtures) != {"action"}:
+                raise ValueError(
+                    "External-cache-only MoT requires exactly one 'action' expert."
+                )
+        elif "video" not in mixtures or "action" not in mixtures:
             raise ValueError("`mixtures` must include both 'video' and 'action' experts.")
 
         self.mixtures = nn.ModuleDict(mixtures)
@@ -279,6 +286,10 @@ class MoT(nn.Module):
                 - `k`: video key tensor [B, Sv, H*Dh]
                 - `v`: video value tensor [B, Sv, H*Dh]
         """
+        if self.external_video_cache_only:
+            raise RuntimeError(
+                "External-cache-only MoT cannot prefill video cache; provide an external cache."
+            )
         if "video" not in self.mixtures:
             raise ValueError("MoT requires `video` expert for `prefill_video_cache`.")
         if video_attention_mask.ndim != 2:
@@ -452,6 +463,10 @@ class MoT(nn.Module):
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
     ):
+        if self.external_video_cache_only:
+            raise RuntimeError(
+                "External-cache-only MoT only supports forward_action_with_video_cache()."
+            )
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
             raise ValueError(f"Missing expert tokens for {missing}")

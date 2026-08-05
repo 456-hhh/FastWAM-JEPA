@@ -1,4 +1,5 @@
+from .jepa_kv_cache_generator import JepaKVCacheGenerator
 from .vjepa_ac_joint_predictor import VJepaACJointPredictor
 from .vjepa_encoder_wrapper import VJepaEncoderWrapper
 
-__all__ = ["VJepaACJointPredictor", "VJepaEncoderWrapper"]
+__all__ = ["JepaKVCacheGenerator", "VJepaACJointPredictor", "VJepaEncoderWrapper"]

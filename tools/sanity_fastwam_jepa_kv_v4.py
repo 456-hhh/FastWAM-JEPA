@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -91,6 +95,159 @@ def cache_max_difference(
         for key in ("k", "v")
     ]
     return max(differences)
+
+
+def _require_finite(name: str, value: torch.Tensor) -> None:
+    if not bool(torch.isfinite(value).all()):
+        raise AssertionError(f"{name} is not finite.")
+
+
+def _teacher_kind_from_identity(value: Any) -> str:
+    normalized = str(value).strip().lower().replace("-", "_")
+    if ("fastwam" in normalized and "idm" in normalized) or normalized.startswith(
+        "libero_idm"
+    ):
+        return "fastwam_idm"
+    if (
+        normalized.endswith("create_fastwam")
+        or normalized.endswith("create_fastwam_joint")
+        or normalized.endswith(".fastwam")
+        or normalized.endswith(".fastwamjoint")
+    ):
+        return "fastwam"
+    return "unknown"
+
+
+def _scalar_hints(value: Any, *, depth: int = 0) -> Iterator[str]:
+    if depth > 4:
+        return
+    if isinstance(value, argparse.Namespace):
+        value = vars(value)
+    if isinstance(value, Mapping):
+        container_keys = {"metadata", "args", "config", "cfg", "model"}
+        identity_keys = {
+            "_target_",
+            "target",
+            "task",
+            "model_kind",
+            "model_type",
+            "teacher_kind",
+            "model_class",
+            "teacher_class",
+            "architecture",
+            "arch",
+        }
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 128:
+                break
+            normalized_key = str(key).strip().lower()
+            if normalized_key in container_keys or normalized_key in identity_keys:
+                yield from _scalar_hints(item, depth=depth + 1)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value[:128]:
+            yield from _scalar_hints(item, depth=depth + 1)
+        return
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        yield str(value)
+
+
+def _checkpoint_kind(checkpoint_info: Mapping[str, Any]) -> str:
+    kinds = {
+        kind
+        for hint in _scalar_hints(checkpoint_info)
+        if (kind := _teacher_kind_from_identity(hint)) != "unknown"
+    }
+    if len(kinds) > 1:
+        return "conflict"
+    return next(iter(kinds), "unknown")
+
+
+def _compact_metadata(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 2:
+        return f"<{type(value).__name__}>"
+    if isinstance(value, argparse.Namespace):
+        value = vars(value)
+    if isinstance(value, Mapping):
+        items = list(value.items())[:16]
+        compact = {
+            str(key): _compact_metadata(item, depth=depth + 1)
+            for key, item in items
+            if not torch.is_tensor(item)
+        }
+        if len(value) > len(items):
+            compact["..."] = f"{len(value) - len(items)} more keys"
+        return compact
+    if isinstance(value, (list, tuple)):
+        return [_compact_metadata(item, depth=depth + 1) for item in value[:8]]
+    if torch.is_tensor(value):
+        return f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype})"
+    text = str(value)
+    return text if len(text) <= 160 else text[:157] + "..."
+
+
+@contextmanager
+def _suppress_dataset_stats_write():
+    from fastwam.datasets.lerobot import robot_video_dataset
+
+    original = robot_video_dataset.save_dataset_stats_to_json
+    robot_video_dataset.save_dataset_stats_to_json = lambda *_args, **_kwargs: None
+    try:
+        yield
+    finally:
+        robot_video_dataset.save_dataset_stats_to_json = original
+
+
+def _vjepa_patch_size(vjepa: nn.Module) -> Any:
+    core = getattr(vjepa, "encoder", None)
+    patch_embed = getattr(core, "patch_embed", None)
+    patch_size = getattr(patch_embed, "patch_size", None)
+    if patch_size is None:
+        patch_size = getattr(core, "patch_size", None)
+    if isinstance(patch_size, (list, tuple)):
+        return tuple(int(value) for value in patch_size)
+    return patch_size
+
+
+def _validate_teacher_identity(
+    *,
+    teacher: nn.Module,
+    config_target: str,
+    checkpoint_info: Mapping[str, Any],
+    expected_kind: str | None,
+) -> tuple[str, str]:
+    config_kind = _teacher_kind_from_identity(config_target)
+    class_name = f"{teacher.__class__.__module__}.{teacher.__class__.__name__}"
+    class_kind = _teacher_kind_from_identity(class_name)
+    if config_kind == "unknown" or class_kind == "unknown":
+        raise ValueError(
+            f"Could not classify teacher config/class: target={config_target}, class={class_name}."
+        )
+    if config_kind != class_kind:
+        raise ValueError(
+            f"Teacher config/class mismatch: config={config_kind}, class={class_kind}."
+        )
+    checkpoint_kind = _checkpoint_kind(checkpoint_info)
+    if checkpoint_kind == "conflict":
+        raise ValueError("Teacher checkpoint metadata contains conflicting FastWAM kinds.")
+    if checkpoint_kind != "unknown" and checkpoint_kind != class_kind:
+        raise ValueError(
+            "Teacher checkpoint/runtime mismatch: "
+            f"checkpoint={checkpoint_kind}, runtime={class_kind}."
+        )
+    if expected_kind is not None and class_kind != expected_kind:
+        raise ValueError(
+            f"Expected teacher kind {expected_kind}, but runtime kind is {class_kind}."
+        )
+    if (
+        expected_kind is not None
+        and checkpoint_kind != "unknown"
+        and checkpoint_kind != expected_kind
+    ):
+        raise ValueError(
+            f"Expected checkpoint kind {expected_kind}, detected {checkpoint_kind}."
+        )
+    return class_name, checkpoint_kind
 
 
 def run_dummy_sanity() -> None:
@@ -312,13 +469,348 @@ def run_dummy_sanity() -> None:
     )
 
 
+@torch.no_grad()
+def run_real_smoke(args: argparse.Namespace) -> None:
+    from tools.train_fastwam_jepa_kv_v4_stage1_distill import (
+        build_loader,
+        build_teacher,
+        build_vjepa_encoder,
+        camera_order_from_cfg,
+        canonicalize_batch,
+        compose_cfg,
+        kv_cache_distillation_loss,
+        precision_dtypes,
+        prepare_teacher_context,
+        require_file,
+        seed_everything,
+        teacher_current_frame_cache,
+    )
+
+    required_paths = (
+        "libero_data_root",
+        "dataset_stats_path",
+        "teacher_checkpoint",
+        "vjepa_repo",
+        "vjepa_checkpoint",
+    )
+    missing = [f"--{name.replace('_', '-')}" for name in required_paths if not getattr(args, name)]
+    if missing:
+        raise ValueError(f"--real-smoke requires: {', '.join(missing)}")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size != 1 or torch.distributed.is_initialized():
+        raise RuntimeError("--real-smoke is single-process only; do not use torchrun or DDP.")
+    if int(args.seed) <= 0:
+        raise ValueError("--seed must be positive.")
+
+    seed_everything(int(args.seed))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    param_dtype, _ = precision_dtypes(str(args.precision), device)
+    cfg = compose_cfg(str(args.config_name), str(args.task))
+    config_target = str(cfg.model.get("_target_", "unknown"))
+    config_kind = _teacher_kind_from_identity(config_target)
+    if args.expected_teacher_kind is not None and config_kind != args.expected_teacher_kind:
+        raise ValueError(
+            f"Configured teacher kind is {config_kind}, expected {args.expected_teacher_kind}."
+        )
+    camera_order = camera_order_from_cfg(cfg)
+
+    args.batch_size = 1
+    args.num_workers = 0
+    with _suppress_dataset_stats_write():
+        loader, sampler = build_loader(
+            cfg,
+            args=args,
+            ddp_enabled=False,
+            world_size=1,
+            rank=0,
+        )
+    if sampler is not None:
+        raise AssertionError("Real smoke unexpectedly created a DistributedSampler.")
+    raw_batch = next(iter(loader))
+    batch = canonicalize_batch(raw_batch, device=device, dtype=param_dtype)
+    raw_context_mask = batch["context_mask"]
+    valid_token_count = [int(value) for value in raw_context_mask.sum(dim=1).tolist()]
+    mask_all_true = bool(raw_context_mask.all().item())
+    print(f"context_shape={tuple(batch['context'].shape)}", flush=True)
+    print(f"context_mask_shape={tuple(raw_context_mask.shape)}", flush=True)
+    print(f"valid_token_count={valid_token_count}", flush=True)
+    print(f"mask_all_true={str(mask_all_true).lower()}", flush=True)
+    if mask_all_true:
+        raise AssertionError(
+            "Real LIBERO context_mask is all True; refusing legacy all-true mask fallback."
+        )
+
+    teacher_path = require_file(str(args.teacher_checkpoint), name="--teacher-checkpoint")
+    checkpoint_info: dict[str, Any] = {}
+    teacher = build_teacher(
+        cfg,
+        checkpoint_path=teacher_path,
+        device=device,
+        dtype=param_dtype,
+        rank=0,
+        checkpoint_info=checkpoint_info,
+    )
+    teacher_python_class, teacher_checkpoint_kind = _validate_teacher_identity(
+        teacher=teacher,
+        config_target=config_target,
+        checkpoint_info=checkpoint_info,
+        expected_kind=args.expected_teacher_kind,
+    )
+    teacher_metadata = checkpoint_info.get("metadata")
+    print(f"teacher_python_class={teacher_python_class}", flush=True)
+    print(f"teacher_config_target={config_target}", flush=True)
+    print(f"teacher_task={args.task}", flush=True)
+    print(f"teacher_checkpoint_path={teacher_path}", flush=True)
+    print(
+        "teacher_checkpoint_metadata="
+        + ("absent" if teacher_metadata is None else repr(_compact_metadata(teacher_metadata))),
+        flush=True,
+    )
+    print(f"teacher_checkpoint_kind={teacher_checkpoint_kind}", flush=True)
+    print("teacher_cache_source=current_frame_only", flush=True)
+
+    required_teacher_api = (
+        "video_expert",
+        "action_expert",
+        "mot",
+        "_encode_video_latents",
+        "_append_proprio_to_context",
+    )
+    missing_teacher_api = [name for name in required_teacher_api if not hasattr(teacher, name)]
+    if missing_teacher_api:
+        raise AssertionError(f"Teacher is missing required shared FastWAM API: {missing_teacher_api}.")
+    if any(parameter.requires_grad for parameter in teacher.parameters()):
+        raise AssertionError("Teacher parameters are not fully frozen.")
+
+    vjepa, _ = build_vjepa_encoder(args, device=device, dtype=param_dtype, rank=0)
+    if any(parameter.requires_grad for parameter in vjepa.parameters()):
+        raise AssertionError("V-JEPA parameters are not fully frozen.")
+    action_expert = teacher.action_expert
+    generator = JepaKVCacheGenerator(
+        input_dim=int(args.vjepa_dim),
+        context_dim=int(action_expert.text_dim),
+        hidden_dim=int(args.hidden_dim),
+        num_layers=len(action_expert.blocks),
+        num_heads=int(action_expert.num_heads),
+        attn_head_dim=int(action_expert.attn_head_dim),
+        video_seq_len=int(args.video_seq_len),
+        layer_rank=int(args.layer_rank),
+        num_cameras=len(camera_order),
+    ).to(device=device, dtype=param_dtype)
+    if generator.parameter_count <= 8440:
+        raise AssertionError(
+            f"Generator parameter count looks like a dummy configuration: {generator.parameter_count}."
+        )
+    action_horizon = int(batch["action"].shape[1])
+    student = FastWAMJEPAKVV4(
+        action_expert=action_expert,
+        vjepa_encoder=vjepa,
+        kv_generator=generator,
+        camera_order=camera_order,
+        proprio_dim=None,
+        action_horizon=action_horizon,
+        freeze_vjepa=True,
+        freeze_action=True,
+        freeze_proprio=True,
+        torch_dtype=param_dtype,
+    ).eval()
+    forbidden_student_modules = ("vae", "video_expert", "future_predictor")
+    student_keys = tuple(student.state_dict())
+    if any(term in key.lower() for key in student_keys for term in forbidden_student_modules):
+        raise AssertionError("v4 student contains a forbidden Wan/Future module.")
+
+    teacher_context, teacher_mask = prepare_teacher_context(teacher, batch)
+    video_a = batch["video"][:1]
+    if video_a.shape[2] < 2:
+        raise AssertionError("Future-leakage smoke requires at least two video frames.")
+    video_b = video_a.clone()
+    video_b[:, :, 1:] = video_b[:, :, 1:] + 0.125
+    if not torch.equal(video_a[:, :, 0], video_b[:, :, 0]):
+        raise AssertionError("Future-leakage inputs do not share frame zero.")
+    if torch.equal(video_a[:, :, 1:], video_b[:, :, 1:]):
+        raise AssertionError("Future-leakage inputs do not differ after frame zero.")
+
+    current = extract_causal_current_frame(video_a)
+    camera_frames = split_dual_camera_current_frame(
+        current,
+        camera_order=camera_order,
+        image_size=int(args.vjepa_img_size),
+    )
+    camera_clips = [build_duplicated_vjepa_clip(frame) for frame in camera_frames]
+    duplicated_frames_equal = all(
+        torch.equal(clip[:, :, 0], clip[:, :, 1]) for clip in camera_clips
+    )
+    if not duplicated_frames_equal:
+        raise AssertionError("A real V-JEPA clip contains unequal duplicated frames.")
+    expected_clip_shape = (1, 3, 2, int(args.vjepa_img_size), int(args.vjepa_img_size))
+    if any(tuple(clip.shape) != expected_clip_shape for clip in camera_clips):
+        raise AssertionError(
+            f"Unexpected real V-JEPA camera clip shapes: {[tuple(clip.shape) for clip in camera_clips]}."
+        )
+
+    captured_vjepa: dict[str, tuple[int, ...]] = {}
+
+    def capture_vjepa_shape(_module, _inputs, output) -> None:
+        if not torch.is_tensor(output):
+            raise AssertionError("Real V-JEPA wrapper returned a non-tensor output.")
+        captured_vjepa["shape"] = tuple(int(value) for value in output.shape)
+
+    hook = vjepa.register_forward_hook(capture_vjepa_shape)
+    try:
+        visual_tokens_a = student.encode_current_frame(video_a)
+    finally:
+        hook.remove()
+    visual_debug = dict(student.last_debug)
+    visual_tokens_b = student.encode_current_frame(video_b)
+    if not torch.equal(visual_tokens_a, visual_tokens_b):
+        raise AssertionError("Future frames changed real V-JEPA current-frame tokens.")
+    raw_shape = captured_vjepa.get("shape")
+    if raw_shape is None or len(raw_shape) != 3:
+        raise AssertionError(f"Could not capture real V-JEPA output shape: {raw_shape}.")
+    if raw_shape[0] != len(camera_order):
+        raise AssertionError(f"Real V-JEPA camera batch mismatch: {raw_shape}.")
+    dense_grid = tuple(int(value) for value in visual_debug["vjepa_dense_grid"])
+    extra_tokens_detected = raw_shape[1] != dense_grid[0] * dense_grid[1]
+    if extra_tokens_detected:
+        raise AssertionError(
+            f"Real V-JEPA produced extra CLS/register tokens: raw={raw_shape}, grid={dense_grid}."
+        )
+    expected_visual_shape = (1, int(args.video_seq_len), int(args.vjepa_dim))
+    if tuple(visual_tokens_a.shape) != expected_visual_shape:
+        raise AssertionError(
+            f"Visual tokens must be {expected_visual_shape}, got {tuple(visual_tokens_a.shape)}."
+        )
+
+    student_cache_a = generator(visual_tokens_a, teacher_context, teacher_mask)
+    student_cache_b = generator(visual_tokens_b, teacher_context, teacher_mask)
+    assert_cache_close(student_cache_a, student_cache_b, atol=0.0)
+    teacher_cache, teacher_grid = teacher_current_frame_cache(
+        teacher, video_a, teacher_context, teacher_mask
+    )
+    if teacher_grid != (1, 7, 14):
+        raise AssertionError(f"Teacher grid must be (1,7,14), got {teacher_grid}.")
+    if len(teacher_cache) != len(action_expert.blocks):
+        raise AssertionError(
+            f"Teacher cache layers {len(teacher_cache)} != ActionDiT layers {len(action_expert.blocks)}."
+        )
+    cache_dim = int(action_expert.num_heads) * int(action_expert.attn_head_dim)
+    expected_cache_shape = (1, int(args.video_seq_len), cache_dim)
+    for layer_index, (teacher_layer, student_layer) in enumerate(
+        zip(teacher_cache, student_cache_a)
+    ):
+        for key in ("k", "v"):
+            if tuple(teacher_layer[key].shape) != expected_cache_shape:
+                raise AssertionError(
+                    f"Teacher cache layer {layer_index} {key} has {tuple(teacher_layer[key].shape)}."
+                )
+            if student_layer[key].shape != teacher_layer[key].shape:
+                raise AssertionError(
+                    f"Student/teacher cache mismatch at layer {layer_index} {key}."
+                )
+
+    loss_total, loss_metrics = kv_cache_distillation_loss(
+        student_cache_a, teacher_cache, lambda_cos=0.1
+    )
+    _require_finite("loss_total", loss_total)
+    for name in ("loss_k", "loss_v", "loss_cos", "cos_first", "cos_middle", "cos_last"):
+        _require_finite(name, loss_metrics[name])
+
+    noise_generator = torch.Generator(device="cpu").manual_seed(int(args.seed))
+    fixed_noisy_action = torch.randn(
+        (1, action_horizon, int(action_expert.action_dim)),
+        generator=noise_generator,
+        dtype=torch.float32,
+    ).to(device=device, dtype=param_dtype)
+    fixed_timestep = torch.full((1,), 0.5, device=device, dtype=param_dtype)
+    teacher_action = student.predict_action_noise_with_cache(
+        fixed_noisy_action,
+        fixed_timestep,
+        teacher_context,
+        teacher_mask,
+        teacher_cache,
+    )
+    student_action = student.predict_action_noise_with_cache(
+        fixed_noisy_action,
+        fixed_timestep,
+        teacher_context,
+        teacher_mask,
+        student_cache_a,
+    )
+    teacher_student_action_mse = F.mse_loss(
+        teacher_action.float(), student_action.float()
+    )
+    teacher_student_action_cosine = F.cosine_similarity(
+        teacher_action.float().flatten(1), student_action.float().flatten(1), dim=1
+    ).mean()
+    teacher_action_norm = teacher_action.float().norm()
+    student_action_norm = student_action.float().norm()
+    for name, value in (
+        ("teacher_student_action_mse", teacher_student_action_mse),
+        ("teacher_student_action_cosine", teacher_student_action_cosine),
+        ("teacher_action_norm", teacher_action_norm),
+        ("student_action_norm", student_action_norm),
+    ):
+        _require_finite(name, value)
+
+    print("REAL_SMOKE_PASS", flush=True)
+    print("selected_frame_index=0", flush=True)
+    print("duplicated_frames_equal=true", flush=True)
+    print("future_leakage=false", flush=True)
+    print(f"teacher_class={teacher_python_class}", flush=True)
+    print(f"teacher_grid={teacher_grid}", flush=True)
+    print(f"camera_order={tuple(camera_order)}", flush=True)
+    print(f"camera_frame_shapes={tuple(tuple(frame.shape) for frame in camera_frames)}", flush=True)
+    print(f"vjepa_raw_shape={raw_shape}", flush=True)
+    print(f"vjepa_raw_shape_per_camera={(1, raw_shape[1], raw_shape[2])}", flush=True)
+    print(f"vjepa_tokens_per_camera={raw_shape[1]}", flush=True)
+    print(f"vjepa_dim={raw_shape[2]}", flush=True)
+    print(f"tubelet_size={getattr(vjepa, 'tubelet_size', None)}", flush=True)
+    print(f"patch_size={_vjepa_patch_size(vjepa)}", flush=True)
+    print(f"extra_cls_register_tokens={str(extra_tokens_detected).lower()}", flush=True)
+    print("spatial_order=horizontal_7x14_row_major", flush=True)
+    print(f"visual_tokens_shape={tuple(visual_tokens_a.shape)}", flush=True)
+    print(f"action_context_shape={tuple(teacher_context.shape)}", flush=True)
+    print(f"cache_layers={len(student_cache_a)}", flush=True)
+    print(f"cache_shape={tuple(student_cache_a[0]['k'].shape)}", flush=True)
+    print(f"generator_parameters={generator.parameter_count}", flush=True)
+    print(f"loss_total={float(loss_total):.6f}", flush=True)
+    for name in ("loss_k", "loss_v", "loss_cos", "cos_first", "cos_middle", "cos_last"):
+        print(f"{name}={float(loss_metrics[name]):.6f}", flush=True)
+    print(f"teacher_student_action_mse={float(teacher_student_action_mse):.6f}", flush=True)
+    print(f"teacher_student_action_cosine={float(teacher_student_action_cosine):.6f}", flush=True)
+    print(f"teacher_action_norm={float(teacher_action_norm):.6f}", flush=True)
+    print(f"student_action_norm={float(student_action_norm):.6f}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FastWAM-JEPA-KV v4 sanity checks.")
-    parser.add_argument("--dummy", action="store_true", help="Run without real checkpoints.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dummy", action="store_true", help="Run without real checkpoints.")
+    mode.add_argument("--real-smoke", action="store_true", help="Run one real-weight batch.")
+    parser.add_argument("--config-name", default="train")
+    parser.add_argument("--task", default="libero_idm_2cam224_1e-4")
+    parser.add_argument("--libero-data-root", default=None)
+    parser.add_argument("--dataset-stats-path", default=None)
+    parser.add_argument("--teacher-checkpoint", default=None)
+    parser.add_argument("--expected-teacher-kind", choices=("fastwam", "fastwam_idm"), default=None)
+    parser.add_argument("--vjepa-repo", default=None)
+    parser.add_argument("--vjepa-checkpoint", default=None)
+    parser.add_argument("--vjepa-checkpoint-key", default=None)
+    parser.add_argument("--vjepa-model-name", default="vjepa2_vit_giant")
+    parser.add_argument("--vjepa-img-size", type=int, default=256)
+    parser.add_argument("--vjepa-input-range", choices=("-1_1", "0_1"), default="-1_1")
+    parser.add_argument("--vjepa-tubelet-size", type=int, default=2)
+    parser.add_argument("--vjepa-dim", type=int, default=1408)
+    parser.add_argument("--hidden-dim", type=int, default=1024)
+    parser.add_argument("--layer-rank", type=int, default=16)
+    parser.add_argument("--video-seq-len", type=int, default=98)
+    parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16")
+    parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
-    if not args.dummy:
-        raise ValueError("Only --dummy is supported locally; real-weight validation belongs on the server.")
-    run_dummy_sanity()
+    if args.dummy:
+        run_dummy_sanity()
+    else:
+        run_real_smoke(args)
 
 
 if __name__ == "__main__":

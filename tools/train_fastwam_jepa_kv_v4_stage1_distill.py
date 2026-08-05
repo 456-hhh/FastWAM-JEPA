@@ -316,6 +316,7 @@ def build_teacher(
     device: torch.device,
     dtype: torch.dtype,
     rank: int,
+    checkpoint_info: Optional[dict[str, Any]] = None,
 ) -> torch.nn.Module:
     model_cfg = OmegaConf.create(OmegaConf.to_container(cfg.model, resolve=True))
     model_cfg.action_dit_pretrained_path = None
@@ -325,6 +326,21 @@ def build_teacher(
     payload = torch.load(checkpoint_path, map_location="cpu")
     if not isinstance(payload, dict) or "mot" not in payload:
         raise ValueError("Teacher checkpoint must contain the original FastWAM `mot` state_dict.")
+    if checkpoint_info is not None:
+        checkpoint_info["top_level_keys"] = tuple(sorted(str(key) for key in payload))
+        for key in (
+            "metadata",
+            "args",
+            "config",
+            "cfg",
+            "task",
+            "model_kind",
+            "model_type",
+            "teacher_kind",
+            "model_class",
+        ):
+            if key in payload:
+                checkpoint_info[key] = payload[key]
     teacher.mot.load_state_dict(payload["mot"], strict=True)
     if teacher.proprio_encoder is not None:
         if payload.get("proprio_encoder") is None:

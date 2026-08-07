@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import math
+import time
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -20,6 +21,74 @@ from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 
 SELECTED_FRAME_INDEX = 0
+CONTEXT_MASK_MODES = ("baseline_all_true", "cached_real_mask")
+
+
+def normalize_context_mask_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized not in CONTEXT_MASK_MODES:
+        raise ValueError(
+            f"Unsupported context mask mode {mode!r}; expected one of {CONTEXT_MASK_MODES}."
+        )
+    return normalized
+
+
+def prepare_v4_context(
+    context: torch.Tensor,
+    real_context_mask: torch.Tensor,
+    *,
+    mode: str = "baseline_all_true",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero cached padding embeddings, then apply the requested v4 mask protocol."""
+    mode = normalize_context_mask_mode(mode)
+    if context.ndim not in (2, 3):
+        raise ValueError(f"Context must be [L,D] or [B,L,D], got {tuple(context.shape)}.")
+    if real_context_mask.ndim != context.ndim - 1:
+        raise ValueError(
+            "Context mask rank must be one less than context rank, got "
+            f"{tuple(real_context_mask.shape)} vs {tuple(context.shape)}."
+        )
+    if tuple(real_context_mask.shape) != tuple(context.shape[:-1]):
+        raise ValueError(
+            "Context mask shape must match context token axes, got "
+            f"{tuple(real_context_mask.shape)} vs {tuple(context.shape[:-1])}."
+        )
+    real_mask = real_context_mask.to(device=context.device, dtype=torch.bool)
+    if bool((real_mask.reshape(-1, real_mask.shape[-1]).sum(dim=1) == 0).any()):
+        raise ValueError("Every context sample must contain at least one valid text token.")
+    prepared = context.clone().masked_fill(~real_mask.unsqueeze(-1), 0.0)
+    if mode == "baseline_all_true":
+        output_mask = torch.ones_like(real_mask, dtype=torch.bool)
+    else:
+        output_mask = real_mask.clone()
+    return prepared, output_mask
+
+
+def prepare_baseline_compatible_context(
+    context: torch.Tensor,
+    real_context_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return prepare_v4_context(context, real_context_mask, mode="baseline_all_true")
+
+
+def validate_checkpoint_context_mask_mode(
+    metadata: Mapping[str, Any],
+    requested_mode: str,
+    *,
+    checkpoint_name: str,
+    allow_mismatch: bool = False,
+) -> str:
+    requested = normalize_context_mask_mode(requested_mode)
+    checkpoint_mode = metadata.get("context_mask_mode")
+    if checkpoint_mode is None:
+        raise ValueError(f"{checkpoint_name} metadata is missing context_mask_mode.")
+    checkpoint_mode = normalize_context_mask_mode(str(checkpoint_mode))
+    if checkpoint_mode != requested and not allow_mismatch:
+        raise ValueError(
+            f"{checkpoint_name} was trained with {checkpoint_mode}, "
+            f"current run requests {requested}."
+        )
+    return checkpoint_mode
 
 
 def extract_causal_current_frame(video: torch.Tensor) -> torch.Tensor:
@@ -292,6 +361,7 @@ class FastWAMJEPAKVV4(nn.Module):
         freeze_vjepa: bool = True,
         freeze_action: bool = True,
         freeze_proprio: bool = True,
+        context_mask_mode: str = "baseline_all_true",
         device: Optional[str | torch.device] = None,
         torch_dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -307,6 +377,7 @@ class FastWAMJEPAKVV4(nn.Module):
         self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
         self.action_horizon = int(action_horizon)
         self.video_seq_len = int(kv_generator.video_seq_len)
+        self.context_mask_mode = normalize_context_mask_mode(context_mask_mode)
         self.torch_dtype = torch_dtype
         self.mot = MoT(
             mixtures={"action": action_expert},
@@ -348,6 +419,7 @@ class FastWAMJEPAKVV4(nn.Module):
 
         self.debug_counts = {"vjepa_forward": 0, "kv_generator_forward": 0, "action_forward": 0}
         self.last_debug: dict[str, Any] = {"selected_frame_index": SELECTED_FRAME_INDEX}
+        self.last_inference_timing: dict[str, float] = {}
         self._infer_cache_ids: list[int] = []
         if device is not None:
             self.to(device=device, dtype=torch_dtype)
@@ -396,8 +468,11 @@ class FastWAMJEPAKVV4(nn.Module):
         device = self._runtime_device()
         context = context.to(device=device, dtype=self.torch_dtype)
         context_mask = context_mask.to(device=device, dtype=torch.bool)
-        if bool((context_mask.sum(dim=1) == 0).any()):
-            raise ValueError("Each context mask must retain at least one valid text token.")
+        context, context_mask = prepare_v4_context(
+            context,
+            context_mask,
+            mode=self.context_mask_mode,
+        )
 
         if self.proprio_encoder is None:
             if proprio is not None:
@@ -516,6 +591,7 @@ class FastWAMJEPAKVV4(nn.Module):
         *,
         teacher_video_kv_cache: Optional[list[dict[str, torch.Tensor]]] = None,
         lambda_kv: float = 0.0,
+        kv_lambda_cos: float = 0.1,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         required = ("video", "action", "context", "context_mask")
         missing = [key for key in required if key not in sample]
@@ -567,14 +643,22 @@ class FastWAMJEPAKVV4(nn.Module):
             if teacher_video_kv_cache is None:
                 raise ValueError("lambda_kv > 0 requires a teacher video K/V cache.")
             loss_kv, kv_metrics = kv_cache_distillation_loss(
-                cache, teacher_video_kv_cache, lambda_cos=0.0
+                cache, teacher_video_kv_cache, lambda_cos=float(kv_lambda_cos)
             )
             loss_k = kv_metrics["loss_k"]
             loss_v = kv_metrics["loss_v"]
+            loss_cos = kv_metrics["loss_cos"]
+            cos_first = kv_metrics["cos_first"]
+            cos_middle = kv_metrics["cos_middle"]
+            cos_last = kv_metrics["cos_last"]
         else:
             loss_kv = loss_action.new_zeros(())
             loss_k = loss_action.new_zeros(())
             loss_v = loss_action.new_zeros(())
+            loss_cos = loss_action.new_zeros(())
+            cos_first = loss_action.new_zeros(())
+            cos_middle = loss_action.new_zeros(())
+            cos_last = loss_action.new_zeros(())
         total = loss_action + float(lambda_kv) * loss_kv
         return total, {
             "loss_total": float(total.detach()),
@@ -582,6 +666,10 @@ class FastWAMJEPAKVV4(nn.Module):
             "loss_kv": float(loss_kv.detach()),
             "loss_k": float(loss_k.detach()),
             "loss_v": float(loss_v.detach()),
+            "loss_cos": float(loss_cos.detach()),
+            "cos_first": float(cos_first.detach()),
+            "cos_middle": float(cos_middle.detach()),
+            "cos_last": float(cos_last.detach()),
         }
 
     def forward(self, *args: Any, **kwargs: Any):
@@ -601,6 +689,7 @@ class FastWAMJEPAKVV4(nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
     ) -> torch.Tensor:
+        replan_start = time.perf_counter()
         self.eval()
         self.reset_debug_counters()
         if input_image.ndim == 3:
@@ -611,7 +700,24 @@ class FastWAMJEPAKVV4(nn.Module):
         context, context_mask = self._prepare_context(context, context_mask, proprio)
         if context.shape[0] != 1:
             raise ValueError(f"infer_action context batch must be 1, got {context.shape[0]}.")
-        cache = self.generate_video_kv_cache(current, context, context_mask)
+        runtime_device = self._runtime_device()
+
+        def sync_device() -> None:
+            if runtime_device.type == "cuda":
+                torch.cuda.synchronize(runtime_device)
+
+        sync_device()
+        vjepa_start = time.perf_counter()
+        visual_tokens = self.encode_current_frame(current)
+        sync_device()
+        vjepa_ms = (time.perf_counter() - vjepa_start) * 1000.0
+
+        kv_start = time.perf_counter()
+        self.debug_counts["kv_generator_forward"] += 1
+        cache = self.kv_generator(visual_tokens, context, context_mask)
+        self._validate_cache(cache, batch_size=int(visual_tokens.shape[0]))
+        sync_device()
+        kv_generator_ms = (time.perf_counter() - kv_start) * 1000.0
 
         horizon = self.action_horizon if action_horizon is None else int(action_horizon)
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
@@ -627,12 +733,15 @@ class FastWAMJEPAKVV4(nn.Module):
             dtype=action.dtype,
             shift_override=sigma_shift,
         )
+        action_start = time.perf_counter()
         for step_t, step_delta in zip(timesteps, deltas):
             timestep = step_t.unsqueeze(0).to(device=action.device, dtype=action.dtype)
             prediction = self.predict_action_noise_with_cache(
                 action, timestep, context, context_mask, cache
             )
             action = self.infer_action_scheduler.step(prediction, step_delta, action)
+        sync_device()
+        action_denoise_ms = (time.perf_counter() - action_start) * 1000.0
 
         if self.debug_counts["vjepa_forward"] != 1:
             raise RuntimeError(f"Expected one V-JEPA forward, got {self.debug_counts['vjepa_forward']}.")
@@ -647,6 +756,13 @@ class FastWAMJEPAKVV4(nn.Module):
             )
         if len(set(self._infer_cache_ids)) != 1:
             raise RuntimeError("Action denoising did not reuse the same cache object.")
+        self.last_inference_timing = {
+            "vjepa_ms": float(vjepa_ms),
+            "kv_generator_ms": float(kv_generator_ms),
+            "action_denoise_ms": float(action_denoise_ms),
+            "total_replan_ms": float((time.perf_counter() - replan_start) * 1000.0),
+        }
+        self.last_debug["timing_ms"] = dict(self.last_inference_timing)
         return action[0].detach().to(device="cpu", dtype=torch.float32)
 
     def load_student_checkpoint(

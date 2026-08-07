@@ -25,7 +25,9 @@ from fastwam.models.wan22.fastwam_jepa_kv_v4 import (  # noqa: E402
     build_duplicated_vjepa_clip,
     extract_causal_current_frame,
     flatten_horizontal_camera_grids,
+    prepare_v4_context,
     split_dual_camera_current_frame,
+    validate_checkpoint_context_mask_mode,
 )
 from fastwam.models.wan22.mot import MoT  # noqa: E402
 
@@ -338,7 +340,53 @@ def run_dummy_sanity() -> None:
     context_mask = torch.ones(batch_size, 6, dtype=torch.bool)
     context_mask[1, 3:] = False
     proprio = torch.randn(batch_size, 9, 8)
+    padded_context = context.clone()
+    padded_context[~context_mask] = torch.randn_like(padded_context[~context_mask]) * 1000.0
+    for context_mask_mode in ("baseline_all_true", "cached_real_mask"):
+        clean_a, mask_a = prepare_v4_context(
+            context,
+            context_mask,
+            mode=context_mask_mode,
+        )
+        clean_b, mask_b = prepare_v4_context(
+            padded_context,
+            context_mask,
+            mode=context_mask_mode,
+        )
+        if not torch.equal(clean_a, clean_b):
+            raise AssertionError(f"Padding canonicalization failed for {context_mask_mode}.")
+        if bool(clean_a[~context_mask].any()):
+            raise AssertionError(f"Padding was not zeroed for {context_mask_mode}.")
+        expected_mask = (
+            torch.ones_like(context_mask) if context_mask_mode == "baseline_all_true" else context_mask
+        )
+        if not torch.equal(mask_a, expected_mask) or not torch.equal(mask_b, expected_mask):
+            raise AssertionError(f"Unexpected final mask for {context_mask_mode}.")
+    for checkpoint_name in (
+        "Stage1 checkpoint",
+        "Stage2 checkpoint",
+        "evaluator checkpoint",
+    ):
+        mismatch_raised = False
+        try:
+            validate_checkpoint_context_mask_mode(
+                {"context_mask_mode": "cached_real_mask"},
+                "baseline_all_true",
+                checkpoint_name=checkpoint_name,
+            )
+        except ValueError:
+            mismatch_raised = True
+        if not mismatch_raised:
+            raise AssertionError(f"{checkpoint_name} mask mismatch was not rejected.")
+        validate_checkpoint_context_mask_mode(
+            {"context_mask_mode": "cached_real_mask"},
+            "baseline_all_true",
+            checkpoint_name=checkpoint_name,
+            allow_mismatch=True,
+        )
     prepared_context, prepared_mask = model._prepare_context(context, context_mask, proprio)
+    if not bool(prepared_mask.all()):
+        raise AssertionError("baseline_all_true did not produce an all-true action context mask.")
 
     tokens_a = model.encode_current_frame(video_a)
     tokens_b = model.encode_current_frame(video_b)
@@ -373,8 +421,6 @@ def run_dummy_sanity() -> None:
     if cache_max_difference(cache_a, cache_c) <= 1e-6:
         raise AssertionError("Changing current frame did not change the generated cache.")
 
-    padded_context = context.clone()
-    padded_context[~context_mask] = torch.randn_like(padded_context[~context_mask]) * 1000.0
     prepared_padded, padded_mask = model._prepare_context(
         padded_context, context_mask, proprio
     )
@@ -385,6 +431,32 @@ def run_dummy_sanity() -> None:
     )
     if not torch.allclose(pred_a, pred_padded, atol=1e-5, rtol=0.0):
         raise AssertionError("Masked padding changed ActionDiT output.")
+
+    model.context_mask_mode = "cached_real_mask"
+    cached_context, cached_mask = model._prepare_context(context, context_mask, proprio)
+    cached_padded, cached_padded_mask = model._prepare_context(
+        padded_context, context_mask, proprio
+    )
+    if not torch.equal(cached_mask[:, : context.shape[1]], context_mask):
+        raise AssertionError("cached_real_mask did not preserve the real text mask.")
+    cached_cache = model.generate_video_kv_cache(video_a, cached_context, cached_mask)
+    cached_padded_cache = model.generate_video_kv_cache(
+        video_a, cached_padded, cached_padded_mask
+    )
+    assert_cache_close(cached_cache, cached_padded_cache)
+    cached_pred = model.predict_action_noise_with_cache(
+        fixed_noise, fixed_timestep, cached_context, cached_mask, cached_cache
+    )
+    cached_padded_pred = model.predict_action_noise_with_cache(
+        fixed_noise,
+        fixed_timestep,
+        cached_padded,
+        cached_padded_mask,
+        cached_padded_cache,
+    )
+    if not torch.allclose(cached_pred, cached_padded_pred, atol=1e-5, rtol=0.0):
+        raise AssertionError("cached_real_mask padding changed ActionDiT output.")
+    model.context_mask_mode = "baseline_all_true"
 
     sample = {
         "video": video_a,
@@ -530,15 +602,29 @@ def run_real_smoke(args: argparse.Namespace) -> None:
     batch = canonicalize_batch(raw_batch, device=device, dtype=param_dtype)
     raw_context_mask = batch["context_mask"]
     valid_token_count = [int(value) for value in raw_context_mask.sum(dim=1).tolist()]
-    mask_all_true = bool(raw_context_mask.all().item())
+    raw_mask_all_true = bool(raw_context_mask.all().item())
+    if raw_mask_all_true:
+        raise AssertionError("Real smoke batch has no padded context token to validate.")
+    canonical_context, canonical_mask = prepare_v4_context(
+        batch["context"],
+        raw_context_mask,
+        mode=str(args.context_mask_mode),
+    )
+    if bool(canonical_context[~raw_context_mask].any()):
+        raise AssertionError("Real context padding was not zeroed before mask conversion.")
+    final_mask_all_true = bool(canonical_mask.all().item())
     print(f"context_shape={tuple(batch['context'].shape)}", flush=True)
     print(f"context_mask_shape={tuple(raw_context_mask.shape)}", flush=True)
     print(f"valid_token_count={valid_token_count}", flush=True)
-    print(f"mask_all_true={str(mask_all_true).lower()}", flush=True)
-    if mask_all_true:
-        raise AssertionError(
-            "Real LIBERO context_mask is all True; refusing legacy all-true mask fallback."
-        )
+    print(f"raw_mask_all_true={str(raw_mask_all_true).lower()}", flush=True)
+    print(f"context_mask_mode={args.context_mask_mode}", flush=True)
+    print(f"final_mask_all_true={str(final_mask_all_true).lower()}", flush=True)
+    if str(args.context_mask_mode) == "baseline_all_true" and not final_mask_all_true:
+        raise AssertionError("baseline_all_true did not produce an all-true final mask.")
+    if str(args.context_mask_mode) == "cached_real_mask" and not torch.equal(
+        canonical_mask, raw_context_mask
+    ):
+        raise AssertionError("cached_real_mask did not preserve the real mask.")
 
     teacher_path = require_file(str(args.teacher_checkpoint), name="--teacher-checkpoint")
     checkpoint_info: dict[str, Any] = {}
@@ -612,6 +698,7 @@ def run_real_smoke(args: argparse.Namespace) -> None:
         freeze_vjepa=True,
         freeze_action=True,
         freeze_proprio=True,
+        context_mask_mode=str(args.context_mask_mode),
         torch_dtype=param_dtype,
     ).eval()
     forbidden_student_modules = ("vae", "video_expert", "future_predictor")
@@ -619,7 +706,20 @@ def run_real_smoke(args: argparse.Namespace) -> None:
     if any(term in key.lower() for key in student_keys for term in forbidden_student_modules):
         raise AssertionError("v4 student contains a forbidden Wan/Future module.")
 
-    teacher_context, teacher_mask = prepare_teacher_context(teacher, batch)
+    teacher_context, teacher_mask = prepare_teacher_context(
+        teacher,
+        batch,
+        context_mask_mode=str(args.context_mask_mode),
+    )
+    text_length = int(raw_context_mask.shape[1])
+    if bool(teacher_context[:, :text_length][~raw_context_mask].any()):
+        raise AssertionError("Teacher action context retained non-zero padded text embeddings.")
+    if str(args.context_mask_mode) == "baseline_all_true" and not bool(teacher_mask.all()):
+        raise AssertionError("Teacher/proprio context mask is not all true in baseline mode.")
+    if str(args.context_mask_mode) == "cached_real_mask" and not torch.equal(
+        teacher_mask[:, :text_length], raw_context_mask
+    ):
+        raise AssertionError("Teacher action context did not retain the real text mask.")
     video_a = batch["video"][:1]
     if video_a.shape[2] < 2:
         raise AssertionError("Future-leakage smoke requires at least two video frames.")
@@ -804,6 +904,11 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--layer-rank", type=int, default=16)
     parser.add_argument("--video-seq-len", type=int, default=98)
+    parser.add_argument(
+        "--context-mask-mode",
+        choices=("baseline_all_true", "cached_real_mask"),
+        default="baseline_all_true",
+    )
     parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16")
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()

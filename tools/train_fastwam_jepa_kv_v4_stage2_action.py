@@ -22,6 +22,7 @@ from fastwam.models.wan22.action_dit import ActionDiT  # noqa: E402
 from fastwam.models.wan22.fastwam_jepa_kv_v4 import (  # noqa: E402
     FastWAMJEPAKVV4,
     sha256_file,
+    validate_checkpoint_context_mask_mode,
 )
 from train_fastwam_jepa_kv_v4_stage1_distill import (  # noqa: E402
     autocast_context,
@@ -63,9 +64,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8, help="Local batch size per rank.")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--steps", type=int, default=10000)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--lambda-kv", type=float, default=0.05)
+    parser.add_argument("--lambda-kv", type=float, default=0.1)
+    parser.add_argument("--kv-lambda-cos", type=float, default=0.1)
+    parser.add_argument(
+        "--context-mask-mode",
+        choices=("baseline_all_true", "cached_real_mask"),
+        default="baseline_all_true",
+    )
+    parser.add_argument(
+        "--allow-context-mask-mismatch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--allow-action-teacher-mismatch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--unfreeze-action-last-n", type=int, default=0)
     parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16")
     parser.add_argument("--log-every", type=int, default=20)
@@ -233,17 +250,43 @@ def verify_stage1_metadata(
     *,
     vjepa_checkpoint: Path,
     dataset_stats_path: Path,
+    action_checkpoint: Path,
+    context_mask_mode: str,
+    allow_context_mask_mismatch: bool,
+    allow_action_teacher_mismatch: bool,
     rank: int,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     vjepa_sha = distributed_rank0_sha256(vjepa_checkpoint, rank=rank)
     stats_sha = distributed_rank0_sha256(dataset_stats_path, rank=rank)
+    action_sha = distributed_rank0_sha256(action_checkpoint, rank=rank)
     expected_vjepa = metadata.get("vjepa_checkpoint_sha256")
     expected_stats = metadata.get("dataset_stats_sha256")
-    if expected_vjepa is not None and str(expected_vjepa) != vjepa_sha:
+    if expected_vjepa is None:
+        raise ValueError("Stage1 checkpoint metadata lacks vjepa_checkpoint_sha256.")
+    if expected_stats is None:
+        raise ValueError("Stage1 checkpoint metadata lacks dataset_stats_sha256.")
+    if str(expected_vjepa) != vjepa_sha:
         raise ValueError("Stage1 and Stage2 V-JEPA checkpoint SHA256 values differ.")
-    if expected_stats is not None and str(expected_stats) != stats_sha:
+    if str(expected_stats) != stats_sha:
         raise ValueError("Stage1 and Stage2 dataset stats SHA256 values differ.")
-    return vjepa_sha, stats_sha
+    validate_checkpoint_context_mask_mode(
+        metadata,
+        context_mask_mode,
+        checkpoint_name="Stage1 checkpoint",
+        allow_mismatch=allow_context_mask_mismatch,
+    )
+    expected_teacher = metadata.get("teacher_fastwam_checkpoint_sha256")
+    if expected_teacher is None:
+        if not allow_action_teacher_mismatch:
+            raise ValueError(
+                "Stage1 checkpoint lacks teacher_fastwam_checkpoint_sha256; "
+                "use --allow-action-teacher-mismatch only for an intentional override."
+            )
+    elif str(expected_teacher) != action_sha and not allow_action_teacher_mismatch:
+        raise ValueError(
+            "Stage1 teacher checkpoint SHA256 does not match the Stage2 action checkpoint."
+        )
+    return vjepa_sha, stats_sha, action_sha
 
 
 def save_checkpoint(
@@ -294,8 +337,8 @@ def main() -> None:
     try:
         if args.seed <= 0 or args.steps <= 0:
             raise ValueError("--seed and --steps must be positive.")
-        if args.lambda_kv < 0:
-            raise ValueError("--lambda-kv must be non-negative.")
+        if args.lambda_kv < 0 or args.kv_lambda_cos < 0:
+            raise ValueError("--lambda-kv and --kv-lambda-cos must be non-negative.")
         if not 0 <= int(args.unfreeze_action_last_n) <= 4:
             raise ValueError("--unfreeze-action-last-n must be between 0 and 4.")
         if args.lambda_kv > 0 and not args.teacher_checkpoint:
@@ -333,10 +376,14 @@ def main() -> None:
             dtype=param_dtype,
             rank=rank,
         )
-        vjepa_sha, stats_sha = verify_stage1_metadata(
+        vjepa_sha, stats_sha, action_sha = verify_stage1_metadata(
             stage1_metadata,
             vjepa_checkpoint=vjepa_path,
             dataset_stats_path=stats_path,
+            action_checkpoint=action_path,
+            context_mask_mode=str(args.context_mask_mode),
+            allow_context_mask_mismatch=bool(args.allow_context_mask_mismatch),
+            allow_action_teacher_mismatch=bool(args.allow_action_teacher_mismatch),
             rank=rank,
         )
         vjepa, vjepa_report = build_vjepa_encoder(
@@ -356,6 +403,7 @@ def main() -> None:
             freeze_vjepa=True,
             freeze_action=True,
             freeze_proprio=True,
+            context_mask_mode=str(args.context_mask_mode),
             device=device,
             torch_dtype=param_dtype,
         )
@@ -375,8 +423,14 @@ def main() -> None:
         )
 
         teacher = None
+        teacher_sha = None
         if float(args.lambda_kv) > 0:
             teacher_path = require_file(args.teacher_checkpoint, name="--teacher-checkpoint")
+            teacher_sha = distributed_rank0_sha256(teacher_path, rank=rank)
+            if teacher_sha != action_sha and not bool(args.allow_action_teacher_mismatch):
+                raise ValueError(
+                    "Stage2 teacher checkpoint SHA256 does not match --action-checkpoint."
+                )
             teacher = build_teacher(
                 cfg,
                 checkpoint_path=teacher_path,
@@ -404,7 +458,9 @@ def main() -> None:
             "num_heads": int(model.action_expert.num_heads),
             "head_dim": int(model.action_expert.attn_head_dim),
             "cache_dim": model.kv_generator.cache_dim,
-            "context_mask_mode": "cached_real_mask",
+            "context_mask_mode": str(args.context_mask_mode),
+            "context_preprocessing": "zero_real_padding_then_apply_context_mask_mode",
+            "stage1_context_mask_mode": stage1_metadata.get("context_mask_mode"),
             "dataset_stats_path": str(stats_path),
             "dataset_stats_sha256": stats_sha,
             "vjepa_checkpoint_path": str(vjepa_path),
@@ -412,19 +468,21 @@ def main() -> None:
             "vjepa_load_report": vjepa_report,
             "stage1_checkpoint_path": str(stage1_path),
             "action_checkpoint_path": str(action_path),
+            "action_checkpoint_sha256": action_sha,
+            "lambda_kv": float(args.lambda_kv),
+            "kv_lambda_cos": float(args.kv_lambda_cos),
+            "allow_context_mask_mismatch": bool(args.allow_context_mask_mismatch),
+            "allow_action_teacher_mismatch": bool(args.allow_action_teacher_mismatch),
             "world_size": world_size,
             "action_frozen_by_default": int(args.unfreeze_action_last_n) == 0,
         }
         if rank == 0:
             metadata["stage1_checkpoint_sha256"] = sha256_file(stage1_path)
-            metadata["action_checkpoint_sha256"] = sha256_file(action_path)
             if teacher is not None:
                 metadata["teacher_fastwam_checkpoint_path"] = str(
                     require_file(args.teacher_checkpoint, name="--teacher-checkpoint")
                 )
-                metadata["teacher_fastwam_checkpoint_sha256"] = sha256_file(
-                    metadata["teacher_fastwam_checkpoint_path"]
-                )
+                metadata["teacher_fastwam_checkpoint_sha256"] = teacher_sha
 
         iterator = iter(loader)
         epoch = 0
@@ -436,7 +494,11 @@ def main() -> None:
             batch = canonicalize_batch(raw_batch, device=device, dtype=param_dtype)
             teacher_cache = None
             if teacher is not None:
-                teacher_context, teacher_mask = prepare_teacher_context(teacher, batch)
+                teacher_context, teacher_mask = prepare_teacher_context(
+                    teacher,
+                    batch,
+                    context_mask_mode=str(args.context_mask_mode),
+                )
                 teacher_cache, grid_size = teacher_current_frame_cache(
                     teacher, batch["video"], teacher_context, teacher_mask
                 )
@@ -447,6 +509,7 @@ def main() -> None:
                     batch,
                     teacher_video_kv_cache=teacher_cache,
                     lambda_kv=float(args.lambda_kv),
+                    kv_lambda_cos=float(args.kv_lambda_cos),
                 )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -462,6 +525,10 @@ def main() -> None:
                     f"step={step} loss_total={metrics['loss_total']:.6f} "
                     f"loss_action={metrics['loss_action']:.6f} loss_kv={metrics['loss_kv']:.6f} "
                     f"loss_k={metrics['loss_k']:.6f} loss_v={metrics['loss_v']:.6f} "
+                    f"loss_cos={metrics['loss_cos']:.6f} "
+                    f"cos_first={metrics['cos_first']:.4f} "
+                    f"cos_middle={metrics['cos_middle']:.4f} "
+                    f"cos_last={metrics['cos_last']:.4f} "
                     f"samples_per_sec={samples_per_sec:.2f} lr={scheduler.get_last_lr()[0]:.3e}",
                 )
             if rank == 0 and step % int(args.save_every) == 0:

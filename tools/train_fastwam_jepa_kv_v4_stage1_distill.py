@@ -17,7 +17,7 @@ from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Sampler
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +33,7 @@ from fastwam.models.vjepa.vjepa_encoder_wrapper import VJepaEncoderWrapper  # no
 from fastwam.models.wan22.fastwam_jepa_kv_v4 import (  # noqa: E402
     encode_causal_dual_camera_tokens,
     extract_causal_current_frame,
+    prepare_v4_context,
     sha256_file,
     validate_teacher_cache_row_major,
 )
@@ -62,6 +63,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--lambda-cos", type=float, default=0.1)
+    parser.add_argument(
+        "--context-mask-mode",
+        choices=("baseline_all_true", "cached_real_mask"),
+        default="baseline_all_true",
+    )
+    parser.add_argument("--val-fraction", type=float, default=0.05)
+    parser.add_argument("--val-every", type=int, default=500)
+    parser.add_argument("--val-batches", type=int, default=20)
+    parser.add_argument("--val-seed", type=int, default=2026)
+    parser.add_argument("--val-parity-seed", type=int, default=12345)
     parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16")
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-every", type=int, default=1000)
@@ -159,6 +170,29 @@ def camera_order_from_cfg(cfg: DictConfig) -> tuple[str, str]:
     return order  # type: ignore[return-value]
 
 
+class DistributedEvalSampler(Sampler[int]):
+    """Deterministic rank striding without DistributedSampler padding duplicates."""
+
+    def __init__(self, dataset, *, num_replicas: int, rank: int) -> None:
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        if self.num_replicas <= 0 or not 0 <= self.rank < self.num_replicas:
+            raise ValueError(
+                f"Invalid validation shard rank={self.rank}, replicas={self.num_replicas}."
+            )
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        return 0 if remaining <= 0 else (remaining + self.num_replicas - 1) // self.num_replicas
+
+    def set_epoch(self, _epoch: int) -> None:
+        return None
+
+
 def build_loader(
     cfg: DictConfig,
     *,
@@ -166,32 +200,60 @@ def build_loader(
     ddp_enabled: bool,
     world_size: int,
     rank: int,
-) -> tuple[DataLoader, Optional[DistributedSampler]]:
+    validation: bool = False,
+) -> tuple[DataLoader, Optional[Sampler[int]]]:
     resolve_dataset_dirs(cfg, root=str(args.libero_data_root))
     stats_path = require_file(str(args.dataset_stats_path), name="--dataset-stats-path")
     OmegaConf.update(
         cfg, "data.train.pretrained_norm_stats", str(stats_path), force_add=True
     )
     OmegaConf.update(cfg, "data.train.preserve_context_mask", True, force_add=True)
-    dataset = instantiate(cfg.data.train)
-    sampler: Optional[DistributedSampler] = None
-    if ddp_enabled:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            seed=int(args.seed),
-            drop_last=True,
+    dataset_cfg = OmegaConf.create(OmegaConf.to_container(cfg.data.train, resolve=True))
+    if hasattr(args, "val_fraction"):
+        OmegaConf.update(
+            dataset_cfg,
+            "val_set_proportion",
+            float(args.val_fraction),
+            force_add=True,
         )
+        OmegaConf.update(
+            dataset_cfg,
+            "split_seed",
+            int(args.val_seed),
+            force_add=True,
+        )
+    OmegaConf.update(
+        dataset_cfg,
+        "is_training_set",
+        not bool(validation),
+        force_add=True,
+    )
+    dataset = instantiate(dataset_cfg)
+    sampler: Optional[Sampler[int]] = None
+    if ddp_enabled:
+        if validation:
+            sampler = DistributedEvalSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=rank,
+            )
+        else:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=int(args.seed),
+                drop_last=True,
+            )
     loader = DataLoader(
         dataset,
         batch_size=int(args.batch_size),
-        shuffle=sampler is None,
+        shuffle=sampler is None and not validation,
         sampler=sampler,
         num_workers=int(args.num_workers),
         pin_memory=torch.cuda.is_available(),
-        drop_last=True,
+        drop_last=not validation,
     )
     return loader, sampler
 
@@ -355,9 +417,11 @@ def build_teacher(
 def prepare_teacher_context(
     teacher: torch.nn.Module,
     batch: dict[str, torch.Tensor],
+    context_mask_mode: str = "baseline_all_true",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     context = batch["context"].to(device=teacher.device, dtype=teacher.torch_dtype)
     mask = batch["context_mask"].to(device=teacher.device, dtype=torch.bool)
+    context, mask = prepare_v4_context(context, mask, mode=context_mask_mode)
     proprio = batch["proprio"]
     if proprio.ndim == 3:
         proprio = proprio[:, 0]
@@ -405,6 +469,152 @@ def teacher_current_frame_cache(
         video_attention_mask=video_mask,
     )
     return validate_teacher_cache_row_major(cache, grid_size=grid_size), grid_size
+
+
+@torch.no_grad()
+def run_validation(
+    *,
+    generator: torch.nn.Module,
+    loader: DataLoader,
+    teacher: torch.nn.Module,
+    vjepa: torch.nn.Module,
+    camera_order: tuple[str, str],
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+    autocast_dtype: Optional[torch.dtype],
+    rank: int,
+) -> dict[str, float]:
+    module = unwrap(generator)
+    was_training = module.training
+    module.eval()
+    metric_names = (
+        "val_loss_total",
+        "val_loss_k",
+        "val_loss_v",
+        "val_loss_cos",
+        "val_cos_first",
+        "val_cos_middle",
+        "val_cos_last",
+        "val_action_parity_mse",
+        "val_action_parity_cosine",
+    )
+    sums = {name: 0.0 for name in metric_names}
+    sample_count = 0
+    parity_generator = torch.Generator(device="cpu").manual_seed(
+        int(args.val_parity_seed) + int(rank) * 100003
+    )
+    try:
+        for batch_index, raw_batch in enumerate(loader):
+            if batch_index >= int(args.val_batches):
+                break
+            batch = canonicalize_batch(raw_batch, device=device, dtype=dtype)
+            context, context_mask = prepare_teacher_context(
+                teacher,
+                batch,
+                context_mask_mode=str(args.context_mask_mode),
+            )
+            teacher_cache, grid_size = teacher_current_frame_cache(
+                teacher,
+                batch["video"],
+                context,
+                context_mask,
+            )
+            if grid_size != (1, 7, 14):
+                raise ValueError(f"Validation teacher grid must be (1,7,14), got {grid_size}.")
+            current = extract_causal_current_frame(batch["video"])
+            with autocast_context(device, autocast_dtype):
+                visual_tokens, _ = encode_causal_dual_camera_tokens(
+                    vjepa,
+                    current,
+                    camera_order=camera_order,
+                )
+                student_cache = module(visual_tokens, context, context_mask)
+                loss, metrics = kv_cache_distillation_loss(
+                    student_cache,
+                    teacher_cache,
+                    lambda_cos=float(args.lambda_cos),
+                )
+
+                batch_size = int(batch["action"].shape[0])
+                action_horizon = int(batch["action"].shape[1])
+                noisy_action = torch.randn(
+                    (batch_size, action_horizon, int(teacher.action_expert.action_dim)),
+                    generator=parity_generator,
+                    dtype=torch.float32,
+                ).to(device=device, dtype=dtype)
+                action_timestep = torch.full(
+                    (batch_size,),
+                    0.5,
+                    device=device,
+                    dtype=dtype,
+                )
+                attention_mask = teacher._build_mot_attention_mask(
+                    video_seq_len=int(module.video_seq_len),
+                    action_seq_len=action_horizon,
+                    video_tokens_per_frame=int(module.video_seq_len),
+                    device=device,
+                )
+                pred_teacher = teacher._predict_action_noise_with_cache(
+                    latents_action=noisy_action,
+                    timestep_action=action_timestep,
+                    context=context,
+                    context_mask=context_mask,
+                    video_kv_cache=teacher_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=int(module.video_seq_len),
+                )
+                pred_student = teacher._predict_action_noise_with_cache(
+                    latents_action=noisy_action,
+                    timestep_action=action_timestep,
+                    context=context,
+                    context_mask=context_mask,
+                    video_kv_cache=student_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=int(module.video_seq_len),
+                )
+                parity_mse = torch.nn.functional.mse_loss(
+                    pred_student.float(), pred_teacher.float()
+                )
+                parity_cosine = torch.nn.functional.cosine_similarity(
+                    pred_student.float().flatten(1),
+                    pred_teacher.float().flatten(1),
+                    dim=1,
+                ).mean()
+
+            values = {
+                "val_loss_total": loss,
+                "val_loss_k": metrics["loss_k"],
+                "val_loss_v": metrics["loss_v"],
+                "val_loss_cos": metrics["loss_cos"],
+                "val_cos_first": metrics["cos_first"],
+                "val_cos_middle": metrics["cos_middle"],
+                "val_cos_last": metrics["cos_last"],
+                "val_action_parity_mse": parity_mse,
+                "val_action_parity_cosine": parity_cosine,
+            }
+            for name, value in values.items():
+                if not bool(torch.isfinite(value).all()):
+                    raise RuntimeError(f"Validation metric {name} is not finite.")
+                sums[name] += float(value.detach()) * batch_size
+            sample_count += batch_size
+    finally:
+        module.train(was_training)
+
+    packed = torch.tensor(
+        [sums[name] for name in metric_names] + [float(sample_count)],
+        device=device,
+        dtype=torch.float64,
+    )
+    if dist.is_initialized():
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    global_count = float(packed[-1].item())
+    if global_count <= 0:
+        raise RuntimeError("Stage1 validation produced zero samples across all ranks.")
+    return {
+        name: float(packed[index].item() / global_count)
+        for index, name in enumerate(metric_names)
+    }
 
 
 def unwrap(module: torch.nn.Module) -> torch.nn.Module:
@@ -476,6 +686,12 @@ def main() -> None:
             raise ValueError("--seed must be positive.")
         if args.steps <= 0 or args.lambda_cos < 0:
             raise ValueError("--steps must be positive and --lambda-cos non-negative.")
+        if not 0.0 < float(args.val_fraction) < 1.0:
+            raise ValueError("--val-fraction must be strictly between 0 and 1.")
+        if int(args.val_every) <= 0 or int(args.val_batches) <= 0:
+            raise ValueError("--val-every and --val-batches must be positive.")
+        if int(args.val_seed) < 0 or int(args.val_parity_seed) < 0:
+            raise ValueError("--val-seed and --val-parity-seed must be non-negative.")
         seed_everything(int(args.seed) + rank * 100003)
         param_dtype, autocast_dtype = precision_dtypes(str(args.precision), device)
         cfg = compose_cfg(str(args.config_name), str(args.task))
@@ -489,6 +705,22 @@ def main() -> None:
         )
         if sampler is not None:
             sampler.set_epoch(0)
+        val_loader, val_sampler = build_loader(
+            cfg,
+            args=args,
+            ddp_enabled=ddp_enabled,
+            world_size=world_size,
+            rank=rank,
+            validation=True,
+        )
+        if val_sampler is not None:
+            val_sampler.set_epoch(0)
+        rank0_print(
+            rank,
+            f"episode_split train_samples={len(loader.dataset)} "
+            f"val_samples={len(val_loader.dataset)} val_fraction={float(args.val_fraction):.4f} "
+            f"val_seed={int(args.val_seed)}",
+        )
 
         teacher_path = require_file(str(args.teacher_checkpoint), name="--teacher-checkpoint")
         teacher = build_teacher(
@@ -538,7 +770,13 @@ def main() -> None:
             "num_heads": int(action.num_heads),
             "head_dim": int(action.attn_head_dim),
             "cache_dim": int(action.num_heads) * int(action.attn_head_dim),
-            "context_mask_mode": "cached_real_mask",
+            "context_mask_mode": str(args.context_mask_mode),
+            "context_preprocessing": "zero_real_padding_then_apply_context_mask_mode",
+            "validation_split": "episode_level",
+            "validation_fraction": float(args.val_fraction),
+            "validation_seed": int(args.val_seed),
+            "validation_batches_per_rank": int(args.val_batches),
+            "validation_parity_seed": int(args.val_parity_seed),
             "vjepa_checkpoint_path": str(require_file(args.vjepa_checkpoint, name="--vjepa-checkpoint")),
             "teacher_fastwam_checkpoint_path": str(teacher_path),
             "dataset_stats_path": str(require_file(args.dataset_stats_path, name="--dataset-stats-path")),
@@ -554,11 +792,16 @@ def main() -> None:
         epoch = 0
         start_time = time.perf_counter()
         last_step = 0
+        best_val_action_parity_mse = math.inf
         output_dir = Path(args.output_dir).expanduser().resolve()
         for step in range(1, int(args.steps) + 1):
             raw_batch, iterator, epoch = next_batch(loader, iterator, sampler, epoch)
             batch = canonicalize_batch(raw_batch, device=device, dtype=param_dtype)
-            teacher_context, teacher_mask = prepare_teacher_context(teacher, batch)
+            teacher_context, teacher_mask = prepare_teacher_context(
+                teacher,
+                batch,
+                context_mask_mode=str(args.context_mask_mode),
+            )
             teacher_cache, grid_size = teacher_current_frame_cache(
                 teacher, batch["video"], teacher_context, teacher_mask
             )
@@ -596,6 +839,36 @@ def main() -> None:
                     f"cos_middle={float(metrics['cos_middle'].detach()):.4f} "
                     f"cos_last={float(metrics['cos_last'].detach()):.4f} "
                     f"samples_per_sec={samples_per_sec:.2f} lr={scheduler.get_last_lr()[0]:.3e}",
+                )
+            if step % int(args.val_every) == 0:
+                val_metrics = run_validation(
+                    generator=train_module,
+                    loader=val_loader,
+                    teacher=teacher,
+                    vjepa=vjepa,
+                    camera_order=camera_order,
+                    args=args,
+                    device=device,
+                    dtype=param_dtype,
+                    autocast_dtype=autocast_dtype,
+                    rank=rank,
+                )
+                metadata["last_validation"] = {"step": step, **val_metrics}
+                if val_metrics["val_action_parity_mse"] < best_val_action_parity_mse:
+                    best_val_action_parity_mse = val_metrics["val_action_parity_mse"]
+                    metadata["best_validation"] = {"step": step, **val_metrics}
+                rank0_print(
+                    rank,
+                    f"validation step={step} "
+                    f"loss_total={val_metrics['val_loss_total']:.6f} "
+                    f"loss_k={val_metrics['val_loss_k']:.6f} "
+                    f"loss_v={val_metrics['val_loss_v']:.6f} "
+                    f"loss_cos={val_metrics['val_loss_cos']:.6f} "
+                    f"cos_first={val_metrics['val_cos_first']:.4f} "
+                    f"cos_middle={val_metrics['val_cos_middle']:.4f} "
+                    f"cos_last={val_metrics['val_cos_last']:.4f} "
+                    f"action_parity_mse={val_metrics['val_action_parity_mse']:.6f} "
+                    f"action_parity_cosine={val_metrics['val_action_parity_cosine']:.4f}",
                 )
             if rank == 0 and step % int(args.save_every) == 0:
                 path = save_checkpoint(

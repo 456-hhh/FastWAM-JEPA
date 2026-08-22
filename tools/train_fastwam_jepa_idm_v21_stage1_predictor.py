@@ -70,13 +70,16 @@ def compose_cfg(config_name: str, task: str):
     cfg = _ORIGINAL_COMPOSE_CFG(config_name, task)
     if _ACTIVE_ARGS is None:
         raise RuntimeError("v2.1 arguments were not initialized")
-    OmegaConf.update(cfg, "data.train.action_video_freq_ratio", 1, merge=False)
-    OmegaConf.update(cfg, "data.train.num_frames", 33, merge=False)
+    OmegaConf.update(
+        cfg, "data.train.action_video_freq_ratio", 1, merge=False, force_add=True
+    )
+    OmegaConf.update(cfg, "data.train.num_frames", 33, merge=False, force_add=True)
     OmegaConf.update(
         cfg,
         "data.train.pretrained_norm_stats",
         str(Path(_ACTIVE_ARGS.dataset_stats_path).expanduser().resolve()),
         merge=False,
+        force_add=True,
     )
     return cfg
 

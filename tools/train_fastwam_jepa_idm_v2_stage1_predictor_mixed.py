@@ -437,6 +437,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir", default="runs/fastwam_jepa_idm_v2_stage1_predictor_mixed"
     )
+    parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--precision", default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--seed", type=int, default=42)
@@ -1277,6 +1278,60 @@ def save_checkpoint(
     return path
 
 
+def load_resume_checkpoint(
+    *,
+    predictor: torch.nn.Module,
+    adapter: torch.nn.Module,
+    proprio_encoder: torch.nn.Module | None,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> int:
+    if args.resume_checkpoint is None:
+        return 0
+    checkpoint_path = require_file(
+        args.resume_checkpoint, name="--resume-checkpoint"
+    )
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError("Stage1 resume checkpoint must contain a dict payload.")
+    expected_temporal = getattr(args, "resume_expected_temporal_config", None)
+    if expected_temporal is not None:
+        temporal = payload.get("stage1_temporal_config")
+        if not isinstance(temporal, dict):
+            raise ValueError("Stage1 resume checkpoint is missing stage1_temporal_config.")
+        for key, expected in expected_temporal.items():
+            got = temporal.get(key)
+            if got != expected:
+                raise ValueError(
+                    f"Stage1 resume temporal mismatch for {key}: "
+                    f"checkpoint={got!r}, expected={expected!r}."
+                )
+    for key in ("future_predictor", "jepa_adapter", "optimizer", "step"):
+        if key not in payload:
+            raise ValueError(f"Stage1 resume checkpoint is missing {key!r}.")
+    unwrap_ddp(predictor).load_state_dict(payload["future_predictor"], strict=True)
+    unwrap_ddp(adapter).load_state_dict(payload["jepa_adapter"], strict=True)
+    if proprio_encoder is not None:
+        proprio_state = payload.get("proprio_encoder")
+        if not isinstance(proprio_state, dict):
+            raise ValueError(
+                "Stage1 resume checkpoint is missing proprio_encoder state."
+            )
+        unwrap_ddp(proprio_encoder).load_state_dict(proprio_state, strict=True)
+    optimizer.load_state_dict(payload["optimizer"])
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device)
+    resumed_step = int(payload["step"])
+    if resumed_step < 0:
+        raise ValueError(f"Stage1 resume step must be non-negative, got {resumed_step}.")
+    print(f"resumed_checkpoint={checkpoint_path}", flush=True)
+    print(f"resumed_step={resumed_step}", flush=True)
+    return resumed_step
+
+
 def main() -> None:
     args = parse_args()
     ddp_enabled, world_size, rank, local_rank, device = init_distributed_from_env()
@@ -1415,6 +1470,15 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         trainable_params, lr=float(args.lr), weight_decay=float(args.weight_decay)
     )
+    update_step = load_resume_checkpoint(
+        predictor=predictor,
+        adapter=adapter,
+        proprio_encoder=proprio_encoder,
+        optimizer=optimizer,
+        args=args,
+        device=device,
+    )
+    start_update_step = update_step
 
     block_summary = predictor_block_load_summary(load_stats)
     print(
@@ -1451,7 +1515,6 @@ def main() -> None:
     start_time = time.time()
     optimizer.zero_grad(set_to_none=True)
 
-    update_step = 0
     micro_step = 0
     grad_accum_steps = int(args.grad_accum_steps)
     source_names = sorted(mix.keys())
@@ -1561,7 +1624,8 @@ def main() -> None:
         }
         if update_step == 1 or update_step % int(args.log_every) == 0:
             elapsed = max(time.time() - start_time, 1e-6)
-            samples = update_step * int(args.batch_size) * world_size * grad_accum_steps
+            completed_steps = update_step - start_update_step
+            samples = completed_steps * int(args.batch_size) * world_size * grad_accum_steps
             print(
                 "step="
                 f"{update_step} loss_total={last_loss_dict['loss_total']:.6f} "
@@ -1595,7 +1659,7 @@ def main() -> None:
     if is_rank0(rank):
         final_path = save_checkpoint(
             output_dir=output_dir,
-            step=int(args.steps),
+            step=update_step,
             predictor=predictor,
             adapter=adapter,
             proprio_encoder=proprio_encoder,

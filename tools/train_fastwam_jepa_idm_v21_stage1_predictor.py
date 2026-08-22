@@ -62,6 +62,11 @@ def parse_args() -> argparse.Namespace:
     args.future_frame_count = 4
     args.stage1_drop_action_proprio = True
     args.use_proprio = False
+    args.resume_expected_temporal_config = {
+        "current_repeat": 4,
+        "future_offsets": [1, 2, 3, 4],
+        "causal": True,
+    }
     _ACTIVE_ARGS = args
     return args
 

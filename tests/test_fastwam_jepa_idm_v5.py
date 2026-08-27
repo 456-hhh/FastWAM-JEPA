@@ -111,15 +111,56 @@ def test_v5_stage1_mixed_timestep_forward():
     pre_state = model.visual_dit.pre_dit(visual_tokens, timestep, context, mask)
     t_mod = pre_state["t_mod"]
     assert tuple(t_mod.shape) == (1, 216, 6, model.visual_dit.hidden_dim)
-    zero_mod = model.visual_dit._timestep_modulation(torch.zeros(1), batch_size=1)
+    actual = t_mod[:, TOKENS_PER_TEMPORAL_GROUP:]
     future_mod = model.visual_dit._timestep_modulation(torch.full((1,), 0.5), batch_size=1)
-    assert torch.allclose(
-        t_mod[:, :TOKENS_PER_TEMPORAL_GROUP],
-        zero_mod.unsqueeze(1).expand(-1, TOKENS_PER_TEMPORAL_GROUP, -1, -1),
+    expected_scalar = future_mod.unsqueeze(1).expand(
+        -1, 2 * TOKENS_PER_TEMPORAL_GROUP, -1, -1
     )
-    assert torch.allclose(
+    assert bool(torch.isfinite(actual).all())
+    assert bool(torch.isfinite(expected_scalar).all())
+    scalar_diff = (actual - expected_scalar).abs()
+    max_abs_diff = float(scalar_diff.max())
+    mean_abs_diff = float(scalar_diff.mean())
+    reference = actual[:, :1]
+    future_internal_diff = float((actual - reference).abs().max())
+    print(
+        "stage1_timestep_diagnostics "
+        f"max_abs_diff={max_abs_diff:.12g} "
+        f"mean_abs_diff={mean_abs_diff:.12g} "
+        f"future_internal_diff={future_internal_diff:.12g}"
+    )
+    assert max_abs_diff < 1e-4, (
+        "Scalar/token-wise timestep modulation differs beyond floating-point tolerance: "
+        f"max_abs_diff={max_abs_diff:.12g}, mean_abs_diff={mean_abs_diff:.12g}."
+    )
+    assert future_internal_diff < 1e-6, (
+        "Equal future timesteps produced inconsistent token modulation: "
+        f"max_abs_diff={future_internal_diff:.12g}."
+    )
+
+    all_zero_mod = model.visual_dit._timestep_modulation(
+        torch.zeros(1, 216), batch_size=1
+    )
+    all_future_mod = model.visual_dit._timestep_modulation(
+        torch.full((1, 216), 0.5), batch_size=1
+    )
+    torch.testing.assert_close(
+        t_mod[:, :TOKENS_PER_TEMPORAL_GROUP],
+        all_zero_mod[:, :TOKENS_PER_TEMPORAL_GROUP],
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
         t_mod[:, TOKENS_PER_TEMPORAL_GROUP:],
-        future_mod.unsqueeze(1).expand(-1, 2 * TOKENS_PER_TEMPORAL_GROUP, -1, -1),
+        all_future_mod[:, TOKENS_PER_TEMPORAL_GROUP:],
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        all_future_mod[:, 0],
+        future_mod,
+        rtol=1e-5,
+        atol=1e-6,
     )
     output = model.visual_dit(visual_tokens, timestep, context, mask)
     assert tuple(output.shape) == (1, 144, VJEPA_DIM)

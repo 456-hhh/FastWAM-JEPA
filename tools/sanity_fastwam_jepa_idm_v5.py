@@ -234,13 +234,55 @@ def main() -> None:
     assert action_trainable == action_total
 
     model.zero_grad(set_to_none=True)
-    loss_visual_stage3, _ = model.visual_training_loss(
-        z0=z0, z1=z1, z2=z2, context=stage3_context, context_mask=stage3_mask
+    stage3_visual_context, stage3_visual_mask = model.build_base_context(
+        context,
+        context_mask,
+        proprio,
     )
+    loss_visual_stage3, _ = model.visual_training_loss(
+        z0=z0,
+        z1=z1,
+        z2=z2,
+        context=stage3_visual_context,
+        context_mask=stage3_visual_mask,
+    )
+    assert bool(torch.isfinite(loss_visual_stage3))
     loss_visual_stage3.backward()
     if grad_norm(model.visual_dit) <= 0:
         raise AssertionError("Stage3 L_visual did not reach Visual DiT.")
     assert_no_grad(model.vjepa_encoder, "Stage3 visual-loss V-JEPA")
+
+    model.zero_grad(set_to_none=True)
+    combined_context, combined_mask = model.build_base_context(
+        context,
+        context_mask,
+        proprio,
+    )
+    loss_visual_combined, _ = model.visual_training_loss(
+        z0=z0,
+        z1=z1,
+        z2=z2,
+        context=combined_context,
+        context_mask=combined_mask,
+    )
+    loss_action_combined, _ = model.action_training_loss_teacher_forcing(
+        z0=z0,
+        z1=z1,
+        z2=z2,
+        action=action,
+        context=combined_context,
+        context_mask=combined_mask,
+    )
+    loss_total = loss_visual_combined + loss_action_combined
+    assert bool(torch.isfinite(loss_total))
+    loss_total.backward()
+    if min(
+        grad_norm(model.visual_dit),
+        grad_norm(model.action_expert),
+        grad_norm(model.proprio_encoder),
+    ) <= 0:
+        raise AssertionError("Stage3 combined-loss gradient routing failed.")
+    assert_no_grad(model.vjepa_encoder, "Stage3 combined-loss V-JEPA")
 
     model.eval()
     visual_tokens = torch.cat((z0, future_a["z1"], future_a["z2"]), dim=1)

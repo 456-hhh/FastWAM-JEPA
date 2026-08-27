@@ -168,14 +168,30 @@ class VisualDiTBlockV5(nn.Module):
         if context_mask is not None and context_mask.dim() == 3:
             context_mask = context_mask.unsqueeze(1)
         has_sequence_timestep = t_mod.ndim == 4
-        chunk_dim = 2 if has_sequence_timestep else 1
-        modulation = self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
+        if has_sequence_timestep:
+            expected_t_mod_shape = (
+                int(x.shape[0]),
+                6,
+                int(x.shape[1]),
+                self.hidden_dim,
+            )
+            base_modulation = self.modulation.unsqueeze(2)
+        else:
+            expected_t_mod_shape = (int(x.shape[0]), 6, self.hidden_dim)
+            base_modulation = self.modulation
+        if tuple(t_mod.shape) != expected_t_mod_shape:
+            timestep_kind = "token-wise" if has_sequence_timestep else "scalar"
+            raise ValueError(
+                f"Visual {timestep_kind} timestep modulation must be "
+                f"{expected_t_mod_shape}, got {tuple(t_mod.shape)}."
+            )
+        modulation = base_modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(
-            6, dim=chunk_dim
+            6, dim=1
         )
         if has_sequence_timestep:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                item.squeeze(2)
+                item.squeeze(1)
                 for item in (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)
             )
         attn_input = modulate(self.norm1(x), shift_msa, scale_msa)

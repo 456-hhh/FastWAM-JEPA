@@ -17,6 +17,7 @@ from fastwam.models.wan22.jepa_visual_dit_v5 import (
     build_v5_joint_attention_mask,
     build_v5_visual_temporal_mask,
 )
+from fastwam.models.wan22 import jepa_visual_dit_v5 as jepa_visual_dit_v5_module
 from fastwam.models.wan22.v5_contract import (
     ACTION_HORIZON,
     TOKENS_PER_TEMPORAL_GROUP,
@@ -72,13 +73,95 @@ def test_v5_pooling_shapes():
     assert tuple(future.shape) == (2, 2, 72, VJEPA_DIM)
 
 
-def test_v5_visual_dit_shapes():
+def test_v5_visual_dit_scalar_timestep_shape():
+    model, _, _, _, context, mask = _conditioning()
+    z0, z1, z2 = random_latents(1)
+    output = model.visual_dit(torch.cat((z0, z1, z2), dim=1), torch.zeros(1), context, mask)
+    assert tuple(output.shape) == (1, 144, VJEPA_DIM)
+
+
+def test_v5_visual_dit_tokenwise_timestep_shape():
     model, _, _, _, context, mask = _conditioning()
     z0, z1, z2 = random_latents(1)
     output = model.visual_dit(
         torch.cat((z0, z1, z2), dim=1), torch.zeros(1, 216), context, mask
     )
     assert tuple(output.shape) == (1, 144, VJEPA_DIM)
+
+
+def test_v5_stage1_mixed_timestep_forward():
+    model, _, _, _, context, mask = _conditioning()
+    z0, z1, z2 = random_latents(1)
+    timestep = torch.cat(
+        (
+            torch.zeros(1, TOKENS_PER_TEMPORAL_GROUP),
+            torch.full((1, 2 * TOKENS_PER_TEMPORAL_GROUP), 0.5),
+        ),
+        dim=1,
+    )
+    assert bool((timestep[:, :TOKENS_PER_TEMPORAL_GROUP] == 0).all())
+    assert bool((timestep[:, TOKENS_PER_TEMPORAL_GROUP:] == 0.5).all())
+    output = model.visual_dit(torch.cat((z0, z1, z2), dim=1), timestep, context, mask)
+    assert tuple(output.shape) == (1, 144, VJEPA_DIM)
+
+
+def test_v5_tokenwise_modulation_splits_component_axis(monkeypatch):
+    model, _, _, _, _, _ = _conditioning()
+    block = model.visual_dit.blocks[0]
+    batch_size = 1
+    sequence_length = 216
+    hidden_dim = block.hidden_dim
+    x = torch.zeros(batch_size, sequence_length, hidden_dim)
+    t_mod = torch.stack(
+        [
+            torch.full((batch_size, sequence_length, hidden_dim), float(component))
+            for component in range(6)
+        ],
+        dim=1,
+    )
+    with torch.no_grad():
+        block.modulation.zero_()
+
+    modulations = []
+    gates = []
+
+    def capture_modulate(value, shift, scale):
+        modulations.append((shift.detach().clone(), scale.detach().clone()))
+        return value
+
+    class ZeroSelfAttention(torch.nn.Module):
+        def forward(self, value, freqs, mask):
+            return torch.zeros_like(value)
+
+    class ZeroCrossAttention(torch.nn.Module):
+        def forward(self, value, context, ctx_mask=None):
+            return torch.zeros_like(value)
+
+    class CaptureGate(torch.nn.Module):
+        def forward(self, value, gate, residual):
+            gates.append(gate.detach().clone())
+            return value
+
+    monkeypatch.setattr(jepa_visual_dit_v5_module, "modulate", capture_modulate)
+    block.self_attn = ZeroSelfAttention()
+    block.cross_attn = ZeroCrossAttention()
+    block.ffn = torch.nn.Identity()
+    block.gate = CaptureGate()
+
+    output = block(x, torch.zeros(1, 1, 4096), t_mod, torch.empty(0))
+    assert tuple(output.shape) == tuple(x.shape)
+    assert len(modulations) == 2
+    assert len(gates) == 2
+    for tensor, component in (
+        (modulations[0][0], 0),
+        (modulations[0][1], 1),
+        (gates[0], 2),
+        (modulations[1][0], 3),
+        (modulations[1][1], 4),
+        (gates[1], 5),
+    ):
+        assert tuple(tensor.shape) == (batch_size, sequence_length, hidden_dim)
+        assert torch.equal(tensor, torch.full_like(tensor, float(component)))
 
 
 def test_v5_no_current_leakage():

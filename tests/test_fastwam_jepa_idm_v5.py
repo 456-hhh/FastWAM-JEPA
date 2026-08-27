@@ -76,16 +76,22 @@ def test_v5_pooling_shapes():
 def test_v5_visual_dit_scalar_timestep_shape():
     model, _, _, _, context, mask = _conditioning()
     z0, z1, z2 = random_latents(1)
-    output = model.visual_dit(torch.cat((z0, z1, z2), dim=1), torch.zeros(1), context, mask)
+    visual_tokens = torch.cat((z0, z1, z2), dim=1)
+    timestep = torch.zeros(1)
+    pre_state = model.visual_dit.pre_dit(visual_tokens, timestep, context, mask)
+    assert tuple(pre_state["t_mod"].shape) == (1, 6, model.visual_dit.hidden_dim)
+    output = model.visual_dit(visual_tokens, timestep, context, mask)
     assert tuple(output.shape) == (1, 144, VJEPA_DIM)
 
 
 def test_v5_visual_dit_tokenwise_timestep_shape():
     model, _, _, _, context, mask = _conditioning()
     z0, z1, z2 = random_latents(1)
-    output = model.visual_dit(
-        torch.cat((z0, z1, z2), dim=1), torch.zeros(1, 216), context, mask
-    )
+    visual_tokens = torch.cat((z0, z1, z2), dim=1)
+    timestep = torch.zeros(1, 216)
+    pre_state = model.visual_dit.pre_dit(visual_tokens, timestep, context, mask)
+    assert tuple(pre_state["t_mod"].shape) == (1, 216, 6, model.visual_dit.hidden_dim)
+    output = model.visual_dit(visual_tokens, timestep, context, mask)
     assert tuple(output.shape) == (1, 144, VJEPA_DIM)
 
 
@@ -101,7 +107,21 @@ def test_v5_stage1_mixed_timestep_forward():
     )
     assert bool((timestep[:, :TOKENS_PER_TEMPORAL_GROUP] == 0).all())
     assert bool((timestep[:, TOKENS_PER_TEMPORAL_GROUP:] == 0.5).all())
-    output = model.visual_dit(torch.cat((z0, z1, z2), dim=1), timestep, context, mask)
+    visual_tokens = torch.cat((z0, z1, z2), dim=1)
+    pre_state = model.visual_dit.pre_dit(visual_tokens, timestep, context, mask)
+    t_mod = pre_state["t_mod"]
+    assert tuple(t_mod.shape) == (1, 216, 6, model.visual_dit.hidden_dim)
+    zero_mod = model.visual_dit._timestep_modulation(torch.zeros(1), batch_size=1)
+    future_mod = model.visual_dit._timestep_modulation(torch.full((1,), 0.5), batch_size=1)
+    assert torch.allclose(
+        t_mod[:, :TOKENS_PER_TEMPORAL_GROUP],
+        zero_mod.unsqueeze(1).expand(-1, TOKENS_PER_TEMPORAL_GROUP, -1, -1),
+    )
+    assert torch.allclose(
+        t_mod[:, TOKENS_PER_TEMPORAL_GROUP:],
+        future_mod.unsqueeze(1).expand(-1, 2 * TOKENS_PER_TEMPORAL_GROUP, -1, -1),
+    )
+    output = model.visual_dit(visual_tokens, timestep, context, mask)
     assert tuple(output.shape) == (1, 144, VJEPA_DIM)
 
 
@@ -117,7 +137,7 @@ def test_v5_tokenwise_modulation_splits_component_axis(monkeypatch):
             torch.full((batch_size, sequence_length, hidden_dim), float(component))
             for component in range(6)
         ],
-        dim=1,
+        dim=2,
     )
     with torch.no_grad():
         block.modulation.zero_()

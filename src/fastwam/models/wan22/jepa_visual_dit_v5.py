@@ -171,27 +171,27 @@ class VisualDiTBlockV5(nn.Module):
         if has_sequence_timestep:
             expected_t_mod_shape = (
                 int(x.shape[0]),
-                6,
                 int(x.shape[1]),
+                6,
                 self.hidden_dim,
             )
-            base_modulation = self.modulation.unsqueeze(2)
+            chunk_dim = 2
         else:
             expected_t_mod_shape = (int(x.shape[0]), 6, self.hidden_dim)
-            base_modulation = self.modulation
+            chunk_dim = 1
         if tuple(t_mod.shape) != expected_t_mod_shape:
             timestep_kind = "token-wise" if has_sequence_timestep else "scalar"
             raise ValueError(
                 f"Visual {timestep_kind} timestep modulation must be "
                 f"{expected_t_mod_shape}, got {tuple(t_mod.shape)}."
             )
-        modulation = base_modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
+        modulation = self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(
-            6, dim=1
+            6, dim=chunk_dim
         )
         if has_sequence_timestep:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                item.squeeze(1)
+                item.squeeze(2)
                 for item in (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)
             )
         attn_input = modulate(self.norm1(x), shift_msa, scale_msa)
@@ -338,7 +338,7 @@ class JEPAVisualDiTV5(nn.Module):
         projected = self.time_projection(embedded).reshape(
             batch_size, VISUAL_TOKEN_COUNT, 6, self.hidden_dim
         )
-        return projected.permute(0, 2, 1, 3).contiguous()
+        return projected
 
     def pre_dit(
         self,

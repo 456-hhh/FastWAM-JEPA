@@ -14,10 +14,12 @@ for path in (PROJECT_ROOT / "src", PROJECT_ROOT / "tools"):
         sys.path.insert(0, str(path))
 
 from fastwam.models.wan22.jepa_visual_dit_v5 import (
+    JEPAVisualDiTV5,
     build_v5_joint_attention_mask,
     build_v5_visual_temporal_mask,
 )
 from fastwam.models.wan22 import jepa_visual_dit_v5 as jepa_visual_dit_v5_module
+from fastwam.models.wan22.wan_video_dit import rope_apply
 from fastwam.models.wan22.v5_contract import (
     ACTION_HORIZON,
     TOKENS_PER_TEMPORAL_GROUP,
@@ -71,6 +73,53 @@ def test_v5_pooling_shapes():
     )
     assert tuple(current.shape) == (2, 1, 72, VJEPA_DIM)
     assert tuple(future.shape) == (2, 2, 72, VJEPA_DIM)
+
+
+@pytest.mark.parametrize("variant", ("tiny", "production_head_dim"))
+def test_v5_visual_rope_stays_complex_after_real_dtype_conversion(variant):
+    if variant == "tiny":
+        visual_dit = build_tiny_model().visual_dit
+    else:
+        visual_dit = JEPAVisualDiTV5(
+            num_layers=1,
+            hidden_dim=32,
+            ffn_dim=64,
+            num_heads=1,
+            attn_head_dim=128,
+            freq_dim=32,
+            use_gradient_checkpointing=False,
+        )
+
+    assert visual_dit.freqs.is_complex()
+    original_freqs = visual_dit.freqs.clone()
+    assert float(original_freqs.imag.abs().max()) > 0
+
+    visual_dit.to(dtype=torch.bfloat16)
+    assert visual_dit.freqs.is_complex()
+    assert float(visual_dit.freqs.imag.abs().max()) > 0
+    torch.testing.assert_close(visual_dit.freqs, original_freqs, rtol=0.0, atol=0.0)
+
+    visual_tokens = torch.randn(1, 216, VJEPA_DIM, dtype=torch.bfloat16)
+    context = torch.randn(1, 8, 4096, dtype=torch.bfloat16)
+    context_mask = torch.ones(1, 8, dtype=torch.bool)
+    pre_state = visual_dit.pre_dit(
+        visual_tokens,
+        torch.zeros(1, dtype=torch.bfloat16),
+        context,
+        context_mask,
+    )
+    assert pre_state["freqs"].is_complex()
+    assert float(pre_state["freqs"].imag.abs().max()) > 0
+
+    rope_input = torch.randn(
+        1,
+        216,
+        visual_dit.num_heads * visual_dit.attn_head_dim,
+        dtype=torch.bfloat16,
+    )
+    rope_output = rope_apply(rope_input, pre_state["freqs"], visual_dit.num_heads)
+    assert tuple(rope_output.shape) == tuple(rope_input.shape)
+    assert bool(torch.isfinite(rope_output).all())
 
 
 def test_v5_visual_dit_scalar_timestep_shape():

@@ -273,7 +273,7 @@ class JEPAVisualDiTV5(nn.Module):
         )
         self.output_norm = nn.LayerNorm(hidden_dim, eps=eps)
         self.output_projection = nn.Linear(hidden_dim, vjepa_dim)
-        self.register_buffer("freqs", self._build_visual_rope(attn_head_dim), persistent=False)
+        self.freqs = self._build_visual_rope(attn_head_dim)
         self.register_buffer(
             "visual_attention_mask", build_v5_visual_temporal_mask(), persistent=False
         )

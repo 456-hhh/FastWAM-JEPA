@@ -44,6 +44,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
         preserve_context_mask: bool = False,
+        strict_errors: bool = False,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -76,6 +77,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
         self.preserve_context_mask = bool(preserve_context_mask)
+        self.strict_errors = bool(strict_errors)
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -273,6 +275,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         return context, context_mask
 
     def __getitem__(self, idx):
+        if self.strict_errors:
+            return self._get(idx)
         try:
             data = self._get(idx)
         except Exception as e:

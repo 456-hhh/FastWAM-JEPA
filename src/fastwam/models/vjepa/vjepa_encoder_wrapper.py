@@ -36,6 +36,7 @@ class VJepaEncoderWrapper(nn.Module):
         input_range: str = "-1_1",
         tubelet_size: int = 2,
         frame_encoding_mode: str = "clip_or_repeat",
+        strict_checkpoint_load: bool = False,
     ) -> None:
         super().__init__()
         self.dummy = bool(dummy)
@@ -52,6 +53,8 @@ class VJepaEncoderWrapper(nn.Module):
         self.input_range = str(input_range)
         self.tubelet_size = int(tubelet_size)
         self.frame_encoding_mode = str(frame_encoding_mode)
+        self.strict_checkpoint_load = bool(strict_checkpoint_load)
+        self.checkpoint_load_report: Optional[dict[str, Any]] = None
         self.encoder: Optional[nn.Module] = None
 
         if self.num_tokens <= 0:
@@ -198,9 +201,39 @@ class VJepaEncoderWrapper(nn.Module):
         state_dict, source_key = self._select_checkpoint_state_dict(checkpoint)
         state_dict = self._strip_state_dict_prefixes(state_dict)
 
-        load_result = self.encoder.load_state_dict(state_dict, strict=False)
+        if self.strict_checkpoint_load:
+            expected_state = self.encoder.state_dict()
+            missing = sorted(set(expected_state) - set(state_dict))
+            unexpected = sorted(set(state_dict) - set(expected_state))
+            mismatched = sorted(
+                key
+                for key in set(expected_state) & set(state_dict)
+                if tuple(expected_state[key].shape) != tuple(state_dict[key].shape)
+            )
+            if missing or unexpected or mismatched:
+                raise RuntimeError(
+                    "Strict V-JEPA2 checkpoint validation failed: "
+                    f"missing_count={len(missing)} missing={missing[:8]}, "
+                    f"unexpected_count={len(unexpected)} unexpected={unexpected[:8]}, "
+                    f"shape_mismatch_count={len(mismatched)} shape_mismatch={mismatched[:8]}."
+                )
+
+        load_result = self.encoder.load_state_dict(
+            state_dict, strict=self.strict_checkpoint_load
+        )
         missing_keys = list(getattr(load_result, "missing_keys", []))
         unexpected_keys = list(getattr(load_result, "unexpected_keys", []))
+        if self.strict_checkpoint_load and (missing_keys or unexpected_keys):
+            raise RuntimeError(
+                "Strict V-JEPA2 checkpoint loading failed: "
+                f"missing={missing_keys}, unexpected={unexpected_keys}."
+            )
+        self.checkpoint_load_report = {
+            "source": source_key,
+            "missing_keys": missing_keys,
+            "unexpected_keys": unexpected_keys,
+            "strict": self.strict_checkpoint_load,
+        }
         print(
             "Loaded V-JEPA2 encoder checkpoint "
             f"from {path.as_posix()} using key {source_key!r}."

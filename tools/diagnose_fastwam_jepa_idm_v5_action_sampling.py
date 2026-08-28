@@ -51,6 +51,7 @@ from fastwam_jepa_v5_data import (  # noqa: E402
 ACTION_DIMENSION_NAMES = ("dx", "dy", "dz", "dRx", "dRy", "dRz", "gripper")
 EXEC_HORIZON = 4
 SIGNIFICANT_FUTURE_GAP_RATIO = 1.5
+DIAGNOSTIC_VAL_SET_PROPORTION = 0.95
 
 
 def parse_args() -> argparse.Namespace:
@@ -263,6 +264,31 @@ def _require_action_processor(loader):
     return processor
 
 
+def _configure_diagnostic_subset(cfg) -> None:
+    cfg.data.train.val_set_proportion = DIAGNOSTIC_VAL_SET_PROPORTION
+    cfg.data.train.is_training_set = True
+
+
+def _diagnostic_dataset_counts(loader) -> tuple[int, int]:
+    dataset = loader.dataset
+    if not hasattr(dataset, "lerobot_dataset"):
+        raise TypeError("V5 LIBERO loader dataset must expose lerobot_dataset.")
+    multi_dataset = dataset.lerobot_dataset.multi_dataset
+    episode_count = int(multi_dataset.num_episodes)
+    frame_count = int(multi_dataset.num_frames)
+    if episode_count <= 0 or frame_count <= 0:
+        raise ValueError(
+            f"Diagnostic subset must be nonempty, got episodes={episode_count}, "
+            f"frames={frame_count}."
+        )
+    if len(dataset) != frame_count:
+        raise ValueError(
+            f"Diagnostic dataset frame count mismatch: len(dataset)={len(dataset)} "
+            f"multi_dataset.num_frames={frame_count}."
+        )
+    return episode_count, frame_count
+
+
 def _denormalize_action(action: torch.Tensor, processor) -> np.ndarray:
     denormalized = rollout_utils._denormalize_action(action, processor)
     expected_shape = (int(action.shape[0]), ACTION_HORIZON, len(ACTION_DIMENSION_NAMES))
@@ -338,6 +364,7 @@ def main() -> None:
     seed_everything(args.seed)
 
     cfg = compose_cfg(args.config_name, args.task)
+    _configure_diagnostic_subset(cfg)
     loader, _ = build_v5_loader(
         cfg,
         libero_data_root=args.libero_data_root,
@@ -348,6 +375,14 @@ def main() -> None:
         ddp_enabled=False,
         world_size=1,
         rank=0,
+    )
+    episode_count, frame_count = _diagnostic_dataset_counts(loader)
+    print(
+        "diagnostic_subset "
+        f"val_set_proportion={DIAGNOSTIC_VAL_SET_PROPORTION:.2f} "
+        "is_training_set=True "
+        f"episodes={episode_count} frames={frame_count}",
+        flush=True,
     )
     processor = _require_action_processor(loader)
     paths = provenance_paths(args, rank=0)

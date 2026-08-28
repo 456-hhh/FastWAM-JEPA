@@ -37,6 +37,7 @@ from diagnose_fastwam_jepa_idm_v5_inference_gap import (
 )
 from diagnose_fastwam_jepa_idm_v5_action_sampling import (
     _action_pair_metrics,
+    _configure_diagnostic_subset,
     _diagnostic_hint,
     _masked_action_metrics,
     _per_dimension_distribution,
@@ -495,6 +496,22 @@ def test_v5_action_sampling_diagnostic_metrics_respect_padding():
         "min": pytest.approx(1.0),
         "max": pytest.approx(1.0),
     }
+
+
+def test_v5_action_sampling_diagnostic_uses_five_percent_episode_subset():
+    class ConfigNode:
+        pass
+
+    cfg = ConfigNode()
+    cfg.data = ConfigNode()
+    cfg.data.train = ConfigNode()
+    cfg.data.train.val_set_proportion = 0.0
+    cfg.data.train.is_training_set = False
+
+    _configure_diagnostic_subset(cfg)
+
+    assert cfg.data.train.val_set_proportion == pytest.approx(0.95)
+    assert cfg.data.train.is_training_set is True
 
 
 @pytest.mark.parametrize(

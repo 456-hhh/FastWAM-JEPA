@@ -35,6 +35,12 @@ from diagnose_fastwam_jepa_idm_v5_inference_gap import (
     _latent_gap_metrics,
     _summarize_kv_cache_gap,
 )
+from diagnose_fastwam_jepa_idm_v5_action_sampling import (
+    _action_pair_metrics,
+    _diagnostic_hint,
+    _masked_action_metrics,
+    _per_dimension_distribution,
+)
 from sanity_fastwam_jepa_idm_v5 import build_tiny_model, grad_norm, random_latents
 
 
@@ -435,5 +441,74 @@ def test_v5_action_horizon_16():
     model, _, _, _, context, mask = _conditioning()
     model.eval()
     visual = torch.randn(1, 3 * TOKENS_PER_TEMPORAL_GROUP, VJEPA_DIM)
-    action = model.infer_action(visual, context, mask, 2, 43)
+    initial_noise = torch.randn(1, ACTION_HORIZON, 7)
+    action = model.infer_action(
+        visual,
+        context,
+        mask,
+        2,
+        43,
+        initial_action_noise=initial_noise,
+    )
+    repeated = model.infer_action(
+        visual,
+        context,
+        mask,
+        2,
+        99,
+        initial_action_noise=initial_noise,
+    )
     assert tuple(action.shape) == (1, ACTION_HORIZON, 7)
+    torch.testing.assert_close(action, repeated, rtol=0.0, atol=0.0)
+
+
+def test_v5_action_sampling_diagnostic_metrics_respect_padding():
+    target = torch.zeros(2, ACTION_HORIZON, 7)
+    prediction = torch.ones_like(target)
+    padding = torch.zeros(2, ACTION_HORIZON, dtype=torch.bool)
+    padding[0, -1] = True
+
+    metrics = _masked_action_metrics(prediction, target, padding)
+    assert metrics["mse"] == pytest.approx(1.0)
+    assert metrics["mae"] == pytest.approx(1.0)
+    assert len(metrics["per_horizon_step_mae"]) == ACTION_HORIZON
+    assert set(metrics["per_action_dimension_mae"]) == {
+        "dx",
+        "dy",
+        "dz",
+        "dRx",
+        "dRy",
+        "dRz",
+        "gripper",
+    }
+    assert all(value == pytest.approx(1.0) for value in metrics["per_action_dimension_mae"].values())
+
+    pair = _action_pair_metrics(prediction, prediction * 2, padding)
+    assert pair["mse"] == pytest.approx(1.0)
+    assert pair["mae"] == pytest.approx(1.0)
+    assert pair["cosine"] == pytest.approx(1.0)
+
+    distribution = _per_dimension_distribution(prediction.numpy(), padding)
+    assert distribution["dx"] == {
+        "mean": pytest.approx(1.0),
+        "std": pytest.approx(0.0),
+        "min": pytest.approx(1.0),
+        "max": pytest.approx(1.0),
+    }
+
+
+@pytest.mark.parametrize(
+    ("gt_mae", "sampled_mae", "zero_mae", "expected"),
+    (
+        (0.6, 0.8, 0.5, "A"),
+        (0.2, 0.4, 0.5, "B"),
+        (0.2, 0.25, 0.5, "C"),
+    ),
+)
+def test_v5_action_sampling_diagnostic_hint(gt_mae, sampled_mae, zero_mae, expected):
+    result = _diagnostic_hint(
+        gt_first4_mae=gt_mae,
+        sampled_first4_mae=sampled_mae,
+        zero_first4_mae=zero_mae,
+    )
+    assert result["category"] == expected

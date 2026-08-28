@@ -4,6 +4,7 @@ import inspect
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -28,6 +29,7 @@ from fastwam.models.wan22.v5_contract import (
     pool_dual_camera_vjepa_tokens,
     split_dual_camera_video,
 )
+from fastwam_jepa_v5_data import resume_training_state, save_compact_checkpoint
 from sanity_fastwam_jepa_idm_v5 import build_tiny_model, grad_norm, random_latents
 
 
@@ -120,6 +122,51 @@ def test_v5_visual_rope_stays_complex_after_real_dtype_conversion(variant):
     rope_output = rope_apply(rope_input, pre_state["freqs"], visual_dit.num_heads)
     assert tuple(rope_output.shape) == tuple(rope_input.shape)
     assert bool(torch.isfinite(rope_output).all())
+
+
+def test_v5_training_checkpoint_loads_numpy_rng_state(tmp_path):
+    source = torch.nn.Linear(2, 2)
+    source_optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    source_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        source_optimizer, lr_lambda=lambda _: 1.0
+    )
+    np.random.seed(42)
+    np.random.normal()
+    checkpoint_path = save_compact_checkpoint(
+        output_dir=tmp_path,
+        step=7,
+        epoch=2,
+        batches_in_epoch=3,
+        weights={"probe": source.state_dict()},
+        optimizer=source_optimizer,
+        scheduler=source_scheduler,
+        metadata={"version": "v5", "stage": "stage1"},
+        rank=0,
+        world_size=1,
+    )
+    assert checkpoint_path is not None
+
+    destination = torch.nn.Linear(2, 2)
+    destination_optimizer = torch.optim.AdamW(destination.parameters(), lr=1e-3)
+    destination_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        destination_optimizer, lr_lambda=lambda _: 1.0
+    )
+    step, epoch, batches_in_epoch, metadata = resume_training_state(
+        checkpoint_path=checkpoint_path,
+        expected_stage="stage1",
+        modules={"probe": destination},
+        optimizer=destination_optimizer,
+        scheduler=destination_scheduler,
+        device=torch.device("cpu"),
+        rank=0,
+        world_size=1,
+    )
+    assert (step, epoch, batches_in_epoch) == (7, 2, 3)
+    assert isinstance(metadata["_resume_rng_state"]["numpy"], tuple)
+    for source_parameter, destination_parameter in zip(
+        source.parameters(), destination.parameters()
+    ):
+        assert torch.equal(source_parameter, destination_parameter)
 
 
 def test_v5_visual_dit_scalar_timestep_shape():

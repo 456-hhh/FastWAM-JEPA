@@ -83,7 +83,7 @@ def _load_stage2_model_parts(
     device: torch.device,
     dtype: torch.dtype,
 ):
-    payload = torch.load(checkpoint_path, map_location="cpu")
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or not isinstance(payload.get("metadata"), dict):
         raise ValueError("Stage2 checkpoint is missing V5 metadata.")
     metadata = payload["metadata"]

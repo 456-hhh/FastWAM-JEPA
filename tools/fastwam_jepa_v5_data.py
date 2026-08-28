@@ -299,7 +299,7 @@ def load_v5_model_checkpoint(
     from fastwam.models.wan22.fastwam_jepa_idm_v5 import FastWAMJEPAIDMV5
     from fastwam.models.wan22.jepa_visual_dit_v5 import JEPAVisualDiTV5
 
-    payload = torch.load(checkpoint_path, map_location="cpu")
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or not isinstance(payload.get("metadata"), dict):
         raise ValueError("V5 model checkpoint is missing metadata.")
     metadata = payload["metadata"]
@@ -519,7 +519,7 @@ def resume_training_state(
     rank: int,
     world_size: int,
 ) -> tuple[int, int, int, dict[str, Any]]:
-    payload = torch.load(checkpoint_path, map_location="cpu")
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or not isinstance(payload.get("metadata"), dict):
         raise ValueError("V5 resume checkpoint is missing metadata.")
     metadata = payload["metadata"]

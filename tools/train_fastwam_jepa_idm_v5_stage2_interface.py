@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
 def _visual_from_stage1(
     checkpoint_path: Path, *, device: torch.device, dtype: torch.dtype
 ) -> tuple[JEPAVisualDiTV5, dict]:
-    payload = torch.load(checkpoint_path, map_location="cpu")
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or not isinstance(payload.get("metadata"), dict):
         raise ValueError("Stage1 checkpoint is missing V5 metadata.")
     metadata = payload["metadata"]

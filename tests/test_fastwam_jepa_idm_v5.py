@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import sys
 from pathlib import Path
 
@@ -30,6 +31,10 @@ from fastwam.models.wan22.v5_contract import (
     split_dual_camera_video,
 )
 from fastwam_jepa_v5_data import resume_training_state, save_compact_checkpoint
+from diagnose_fastwam_jepa_idm_v5_inference_gap import (
+    _latent_gap_metrics,
+    _summarize_kv_cache_gap,
+)
 from sanity_fastwam_jepa_idm_v5 import build_tiny_model, grad_norm, random_latents
 
 
@@ -167,6 +172,31 @@ def test_v5_training_checkpoint_loads_numpy_rng_state(tmp_path):
         source.parameters(), destination.parameters()
     ):
         assert torch.equal(source_parameter, destination_parameter)
+
+
+def test_v5_inference_gap_metric_helpers_are_strict_and_finite():
+    target = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    predicted = torch.tensor([[[1.0, 0.0], [1.0, 0.0]]])
+    latent_metrics = _latent_gap_metrics(predicted, target)
+    assert latent_metrics["mse"] == pytest.approx(0.5)
+    assert latent_metrics["l1"] == pytest.approx(0.5)
+    assert math.isfinite(latent_metrics["cosine"])
+    with pytest.raises(ValueError):
+        _latent_gap_metrics(predicted[:, :1], target)
+
+    gt_cache = [
+        {"k": torch.ones(1, 2, 4), "v": torch.ones(1, 2, 4) * 2}
+        for _ in range(3)
+    ]
+    predicted_cache = [
+        {"k": layer["k"] * 1.5, "v": layer["v"] * 0.5} for layer in gt_cache
+    ]
+    cache_metrics = _summarize_kv_cache_gap(predicted_cache, gt_cache)
+    assert len(cache_metrics["per_layer"]) == 3
+    assert set(cache_metrics["groups"]) == {"early", "middle", "late"}
+    assert cache_metrics["groups"]["early"]["k_relative_l2"] == pytest.approx(0.5)
+    with pytest.raises(ValueError):
+        _summarize_kv_cache_gap(predicted_cache[:2], gt_cache)
 
 
 def test_v5_visual_dit_scalar_timestep_shape():
